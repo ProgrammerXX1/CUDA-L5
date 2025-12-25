@@ -26,13 +26,10 @@ SearchResult search_out_root(const std::filesystem::path& out_root,
 
         SegmentData segdata;
         std::string err;
-        if (!load_segment_bin(seg_dir, segdata, &err)) {
-            continue;
-        }
+        if (!load_segment_bin(seg_dir, segdata, &err)) continue;
+
         std::vector<std::string> docids;
-        if (!load_docids_json(seg_dir, docids, &err)) {
-            continue;
-        }
+        if (!load_docids_json(seg_dir, docids, &err)) continue;
 
         ++res.segments_scanned;
 
@@ -40,7 +37,7 @@ SearchResult search_out_root(const std::filesystem::path& out_root,
         for (auto& m : matches) {
             auto it = best.find(m.doc_id);
             if (it == best.end() || m.score > it->second.score) {
-                best[m.doc_id] = m;
+                best[m.doc_id] = std::move(m);
             }
         }
     }
@@ -50,6 +47,7 @@ SearchResult search_out_root(const std::filesystem::path& out_root,
 
     std::sort(res.matches.begin(), res.matches.end(), [](const Match& a, const Match& b) {
         if (a.score != b.score) return a.score > b.score;
+        if (a.matched_shingles != b.matched_shingles) return a.matched_shingles > b.matched_shingles;
         return a.hits > b.hits;
     });
     if (res.matches.size() > opt.topk) res.matches.resize(opt.topk);
