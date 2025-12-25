@@ -1,0 +1,8 @@
+oysyn@indexoysyn:~/Date_Index/anti-plagiarism/Back_L5$ export PLAGIO_STRICT_TEXT_IS_NORMALIZED=1
+
+rm -rf ./runtime/l5_out
+mkdir -p ./runtime/l5_out
+
+./build/l5_build cpp/tests/data/corpus_100.jsonl ./runtime/l5_out --segment-name seg_100
+./build/l5_validate ./runtime/l5_out
+./build/l5_search ./runtime/l5_out --query "это простой тестовый документ для шингловой с
