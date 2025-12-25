@@ -1,0 +1,5 @@
+test_build_smoke 1 0.00470139
+test_validate 1 0.00406964
+test_search_smoke 0 0
+---
+test_search_smoke
