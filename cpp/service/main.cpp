@@ -44,6 +44,7 @@ static json doc_to_json(const DocRow& d) {
 
 static json upload_to_json(const UploadResult& r) {
   return {
+    {"org_id", r.org_id},
     {"doc_id", r.doc_id},
     {"external_id", r.external_id},
     {"source_name", r.source_name},

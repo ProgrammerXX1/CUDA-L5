@@ -4,11 +4,14 @@
 #include <zip.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <memory>
@@ -16,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -28,6 +32,32 @@ namespace {
 
 constexpr size_t   ZIP_MAX_FILES = 20000;
 constexpr uint64_t ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 10ull * 1024 * 1024 * 1024; // 10 GiB safety cap
+
+// ---- perf knobs: 20 cores + 100 GiB RAM for postings sort ----
+constexpr unsigned  PLAGIO_BUILD_THREADS_DEFAULT = 20u;
+constexpr uint64_t  PLAGIO_SORT_RAM_BYTES_DEFAULT = (100ull << 30); // 100 GiB
+
+// ---- parallel soffice conversion knobs ----
+constexpr unsigned  PLAGIO_CONVERT_PROCS_FALLBACK = 20u;   // default cap (will min with hw)
+constexpr unsigned  PLAGIO_CONVERT_BATCH_DEFAULT  = 200u; // files per one soffice invocation
+
+static unsigned env_u32(const char* k, unsigned defv) {
+  const char* s = std::getenv(k);
+  if (!s || !*s) return defv;
+  char* end = nullptr;
+  unsigned long v = std::strtoul(s, &end, 10);
+  if (!end || *end != '\0') return defv;
+  return (unsigned)v;
+}
+
+static uint64_t env_u64(const char* k, uint64_t defv) {
+  const char* s = std::getenv(k);
+  if (!s || !*s) return defv;
+  char* end = nullptr;
+  unsigned long long v = std::strtoull(s, &end, 10);
+  if (!end || *end != '\0') return defv;
+  return (uint64_t)v;
+}
 
 static void ensure_dirs(const fs::path& p) {
   std::error_code ec;
@@ -73,7 +103,7 @@ static void copy_file_binary(const fs::path& src, const fs::path& dst) {
 }
 
 static std::string shell_quote(const std::string& s) {
-  // single-quote safe for bash: ' -> '\'' 
+  // single-quote safe for bash: ' -> '\''
   std::string out;
   out.reserve(s.size() + 8);
   out.push_back('\'');
@@ -188,6 +218,80 @@ struct CleanupDir {
   }
 };
 
+// ---- PARALLEL soffice conversion (doc/docx -> txt) ----
+// each worker uses its own UserInstallation profile dir to avoid LO lock conflicts
+static void soffice_convert_parallel(const fs::path& conv_src,
+                                    const fs::path& conv_out,
+                                    const fs::path& profiles_base,
+                                    unsigned procs,
+                                    unsigned batch_n) {
+  std::vector<fs::path> inputs;
+  inputs.reserve(4096);
+
+  for (auto it = fs::directory_iterator(conv_src); it != fs::directory_iterator(); ++it) {
+    std::error_code ec;
+    if (!it->is_regular_file(ec) || ec) continue;
+    inputs.push_back(it->path());
+  }
+  if (inputs.empty()) return;
+
+  if (procs == 0) procs = 1;
+  if (procs > (unsigned)inputs.size()) procs = (unsigned)inputs.size();
+  if (batch_n == 0) batch_n = (unsigned)inputs.size();
+
+  // partition inputs into procs groups
+  const size_t n = inputs.size();
+  const size_t per = (n + procs - 1) / procs;
+
+  std::vector<std::thread> th;
+  th.reserve(procs);
+
+  std::vector<std::exception_ptr> errs(procs);
+
+  for (unsigned i = 0; i < procs; ++i) {
+    const size_t start = (size_t)i * per;
+    const size_t end = std::min(n, start + per);
+    if (start >= end) break;
+
+    th.emplace_back([&, i, start, end]() {
+      try {
+        const fs::path profile_dir = profiles_base / ("lo_profile_" + std::to_string(i));
+        ensure_dirs(profile_dir);
+
+        const fs::path abs_profile = fs::absolute(profile_dir);
+        const std::string profile_uri = "file://" + abs_profile.string();
+
+        // convert in chunks to keep cmdline manageable
+        for (size_t j = start; j < end; j += (size_t)batch_n) {
+          const size_t je = std::min(end, j + (size_t)batch_n);
+
+          std::string cmd =
+            "soffice --headless --nologo --nolockcheck --nodefault --norestore"
+            " -env:UserInstallation=" + shell_quote(profile_uri) +
+            " --convert-to " + shell_quote("txt:Text (encoded):UTF8") +
+            " --outdir " + shell_quote(conv_out.string());
+
+          for (size_t k = j; k < je; ++k) {
+            cmd += " " + shell_quote(inputs[k].string());
+          }
+
+          const int rc = run_cmd_bash(cmd);
+          if (rc != 0) {
+            throw std::runtime_error("soffice convert failed rc=" + std::to_string(rc));
+          }
+        }
+      } catch (...) {
+        errs[i] = std::current_exception();
+      }
+    });
+  }
+
+  for (auto& t : th) t.join();
+  for (auto& e : errs) {
+    if (e) std::rethrow_exception(e);
+  }
+}
+
 } // namespace
 
 // -------------------- L5Service --------------------
@@ -275,6 +379,7 @@ UploadResult L5Service::ingest_file(const std::string& org_id,
   st.upsert_doc(row);
 
   UploadResult r;
+  r.org_id = org_id; 
   r.doc_id = doc_id;
   r.external_id = external_id;
   r.source_name = filename;
@@ -303,12 +408,12 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
   fs::path unpack_dir = tmp / "unpacked";
   fs::path conv_src = tmp / "conv_src";
   fs::path conv_out = tmp / "conv_out";
-  fs::path lo_profile = tmp / "lo_profile";
+  fs::path lo_profiles = tmp / "lo_profiles";
 
   ensure_dirs(unpack_dir);
   ensure_dirs(conv_src);
   ensure_dirs(conv_out);
-  ensure_dirs(lo_profile);
+  ensure_dirs(lo_profiles);
 
   write_bytes(zip_path, zip_bytes);
   unzip_libzip_safe(zip_path, unpack_dir);
@@ -373,28 +478,26 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
     throw std::runtime_error("zip has no supported files (.txt/.doc/.docx)");
   }
 
-  // 2) Convert doc/docx (batch) via soffice (isolated profile + UTF-8)
+  unsigned hw = std::thread::hardware_concurrency();
+  if (hw == 0) hw = 4;
+
+  // 2) Convert doc/docx in parallel via multiple soffice processes (isolated profiles)
   {
     bool has_any = false;
     for (auto it = fs::directory_iterator(conv_src); it != fs::directory_iterator(); ++it) {
-      if (it->is_regular_file()) { has_any = true; break; }
+      std::error_code ec;
+      if (it->is_regular_file(ec) && !ec) { has_any = true; break; }
     }
 
     if (has_any) {
-      const fs::path abs_profile = fs::absolute(lo_profile);
-      std::string profile_uri = "file://" + abs_profile.string();
+      const unsigned def_procs = std::min<unsigned>(PLAGIO_CONVERT_PROCS_FALLBACK, hw);
+      unsigned procs = env_u32("PLAGIO_CONVERT_PROCS", def_procs);
+      unsigned batch = env_u32("PLAGIO_CONVERT_BATCH", PLAGIO_CONVERT_BATCH_DEFAULT);
 
-      std::string cmd =
-        "find " + shell_quote(conv_src.string()) + " -type f -print0"
-        " | xargs -0 -n 50 soffice --headless --nologo --nolockcheck --nodefault --norestore"
-        " -env:UserInstallation=" + shell_quote(profile_uri) +
-        " --convert-to " + shell_quote("txt:Text (encoded):UTF8") +
-        " --outdir " + shell_quote(conv_out.string());
+      if (procs == 0) procs = 1;
+      if (procs > hw) procs = hw;
 
-      const int rc = run_cmd_bash(cmd);
-      if (rc != 0) {
-        throw std::runtime_error("soffice convert failed rc=" + std::to_string(rc));
-      }
+      soffice_convert_parallel(conv_src, conv_out, lo_profiles, procs, batch);
     }
   }
 
@@ -408,11 +511,11 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
     std::vector<std::string> doc_ids_for_segment;
   };
 
-  unsigned hw = std::thread::hardware_concurrency();
-  if (hw == 0) hw = 4;
+  const unsigned want_threads = env_u32("PLAGIO_BUILD_THREADS", PLAGIO_BUILD_THREADS_DEFAULT);
+  const unsigned build_threads = std::min<unsigned>(hw, want_threads);
 
-  // I/O: обычно оптимум 8..16 потоков
-  unsigned n_threads = std::min<unsigned>(hw, 16u);
+  // extract threads (I/O): до 20
+  unsigned n_threads = std::min<unsigned>(build_threads, 20u);
   if (n_threads > pending.size()) n_threads = (unsigned)pending.size();
   if (n_threads == 0) n_threads = 1;
 
@@ -457,7 +560,6 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
 
           ExtractedText ex = extract_text_from_file(d.text_path, text_is_normalized);
 
-          // JSONL line (быстрее без построения json-объекта, но строки эскейпим через nlohmann::json)
           outp
             << "{\"doc_id\":" << json(d.doc_id).dump()
             << ",\"organization_id\":" << org_j
@@ -483,6 +585,7 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
           A.rows.push_back(std::move(row));
 
           UploadResult ur;
+          ur.org_id = org_id; 
           ur.doc_id = d.doc_id;
           ur.external_id = d.external_id;
           ur.source_name = d.source_name;
@@ -554,11 +657,15 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
       ? (std::string("seg_") + l5::utc_now_compact() + "_" + gen_uuid_v4().substr(0, 8))
       : segment_name_opt;
 
-  opt.max_threads = hw; // builder multi-thread
+  // 20 threads
+  opt.max_threads = build_threads;
+
+  // 100 GiB RAM for postings sort
+  opt.ram_limit_bytes = env_u64("PLAGIO_SORT_RAM_BYTES", PLAGIO_SORT_RAM_BYTES_DEFAULT);
 
   const fs::path out_root = org_index_root(org_id);
 
-  // ВАЖНО: serialize build per-org shard (manifest / segment creation)
+  // serialize build per-org shard (manifest / segment creation)
   {
     std::lock_guard<std::mutex> lk(build_mu_for(org_id));
     out.build = l5::build_segment_jsonl(corpus, out_root, opt);
@@ -603,7 +710,6 @@ void L5Service::delete_doc(const std::string& org_id, const std::string& key) {
   {
     std::lock_guard<std::mutex> lk(tomb_mu_for(org_id));
     Tombstones ts(org_tombstones(org_id));
-    // load() не нужен: append сам держит in-memory set_ актуальным для текущего объекта.
     ts.append(row->doc_id);
   }
 

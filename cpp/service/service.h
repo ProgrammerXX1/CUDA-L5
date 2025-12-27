@@ -13,6 +13,7 @@
 #include "tombstone.h"
 
 struct UploadResult {
+  std::string org_id; 
   std::string doc_id;
   std::string external_id;
   std::string source_name;
