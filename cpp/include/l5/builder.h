@@ -1,3 +1,4 @@
+// Back_L5/cpp/include/l5/builder.h
 #pragma once
 #include <cstdint>
 #include <filesystem>
@@ -7,11 +8,25 @@ namespace l5 {
 
 struct BuildOptions {
     std::string segment_name; // if empty => auto
-    bool strict_text_is_normalized{false}; // env control (will set env in service usually)
-    uint32_t max_tokens_per_doc{100000};
-    uint32_t max_shingles_per_doc{50000};
+
+    // if true -> if doc has no "text_is_normalized"/"normalized" flag => treat as NOT normalized
+    bool strict_text_is_normalized{false};
+
+    // hard limits / degradation
+    uint32_t max_text_bytes_per_doc{8u * 1024u * 1024u}; // 8 MiB, truncate input text
+    uint32_t max_tokens_per_doc{100000};                 // truncate tokens
+    uint32_t max_shingles_per_doc{50000};                // cap postings per doc
+    uint32_t max_docs_in_segment{0};                     // 0 => unlimited
+
+    // shingling
     int shingle_stride{1};
+
+    // parallelism + bounded pipeline memory
     unsigned max_threads{16};
+    uint32_t inflight_docs{0}; // 0 => auto (4*threads), bounds queue sizes
+
+    // sorting budget (builder process RAM cap)
+    uint64_t ram_limit_bytes{512ull * 1024ull * 1024ull}; // 512 MiB
 };
 
 struct BuildStats {

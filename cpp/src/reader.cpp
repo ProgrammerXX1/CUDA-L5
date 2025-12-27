@@ -1,3 +1,4 @@
+// Back_L5/cpp/src/reader.cpp
 #include "l5/reader.h"
 
 #include <fstream>
@@ -25,6 +26,7 @@ bool load_segment_bin(const std::filesystem::path& seg_dir, SegmentData& out, st
     }
     out.header = h;
 
+    // docmeta: read by fields (padding-safe)
     out.docmeta.resize(h.n_docs);
     for (uint32_t i = 0; i < h.n_docs; ++i) {
         DocMeta dm{};
@@ -38,6 +40,7 @@ bool load_segment_bin(const std::filesystem::path& seg_dir, SegmentData& out, st
         out.docmeta[i] = dm;
     }
 
+    // postings9: read by fields (padding-safe)
     out.postings9.resize((size_t)h.n_post9);
     for (uint64_t i = 0; i < h.n_post9; ++i) {
         Posting9 p{};
@@ -55,15 +58,16 @@ bool load_segment_bin(const std::filesystem::path& seg_dir, SegmentData& out, st
 }
 
 bool load_docids_json(const std::filesystem::path& seg_dir,
-                      std::vector<std::string>& docids,
+                      std::vector<DocInfo>& docs,
                       std::string* err) {
-    docids.clear();
+    docs.clear();
     const auto p = seg_dir / "index_native_docids.json";
     std::ifstream in(p);
     if (!in) {
         if (err) *err = "cannot open " + p.string();
         return false;
     }
+
     json j;
     try {
         in >> j;
@@ -71,14 +75,39 @@ bool load_docids_json(const std::filesystem::path& seg_dir,
         if (err) *err = "failed parsing " + p.string();
         return false;
     }
+
     if (!j.is_array()) {
         if (err) *err = "docids json is not array";
         return false;
     }
-    docids.reserve(j.size());
+
+    docs.reserve(j.size());
+
+    // New format: array of objects
+    if (!j.empty() && j[0].is_object()) {
+        for (auto& v : j) {
+            if (!v.is_object()) continue;
+            DocInfo di;
+            di.doc_id = v.value("doc_id", "");
+            di.organization_id = v.value("organization_id", "");
+            di.external_id = v.value("external_id", "");
+            di.source_path = v.value("source_path", "");
+            di.source_name = v.value("source_name", "");
+            di.meta_path = v.value("meta_path", "");
+            di.preview_text = v.value("preview_text", "");
+            if (di.external_id.empty()) di.external_id = di.doc_id;
+            docs.push_back(std::move(di));
+        }
+        return true;
+    }
+
+    // Old format: array of strings
     for (auto& v : j) {
         if (!v.is_string()) continue;
-        docids.push_back(v.get<std::string>());
+        DocInfo di;
+        di.doc_id = v.get<std::string>();
+        di.external_id = di.doc_id;
+        docs.push_back(std::move(di));
     }
     return true;
 }

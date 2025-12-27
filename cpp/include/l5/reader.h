@@ -1,3 +1,4 @@
+// Back_L5/cpp/include/l5/reader.h
 #pragma once
 #include <cstdint>
 #include <filesystem>
@@ -5,6 +6,7 @@
 #include <vector>
 
 #include "l5/format.h"
+#include "l5/docinfo.h"
 
 namespace l5 {
 
@@ -17,8 +19,9 @@ struct SegmentData {
 
 bool load_segment_bin(const std::filesystem::path& seg_dir, SegmentData& out, std::string* err);
 
+// Теперь читаем массив DocInfo (новый формат) + поддерживаем старый (array of strings)
 bool load_docids_json(const std::filesystem::path& seg_dir,
-                      std::vector<std::string>& docids,
+                      std::vector<DocInfo>& docs,
                       std::string* err);
 
 } // namespace l5

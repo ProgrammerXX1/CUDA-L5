@@ -1,1 +1,0 @@
-/usr/bin/c++ -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -O2 -g -DNDEBUG -fsanitize=address,undefined CMakeFiles/l5_search.dir/cpp/tools/l5_search_main.cpp.o -o l5_search  libl5_engine.a /usr/lib/x86_64-linux-gnu/libsimdjson.so.19.0.0 

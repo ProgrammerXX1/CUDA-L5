@@ -1,3 +1,4 @@
+// Back_L5/cpp/include/l5/result.h
 #pragma once
 #include <cstdint>
 #include <string>
@@ -6,32 +7,37 @@
 
 namespace l5 {
 
-struct Span {
-    uint32_t q_start{0};
-    uint32_t q_end{0};
-    uint32_t d_start{0};
-    uint32_t d_end{0};
-    uint32_t len_shingles{0};
+struct MatchSpan {
+    uint32_t q_from{0};
+    uint32_t q_to{0};
+    uint32_t d_from{0};
+    uint32_t d_to{0};
+    uint32_t length{0};
 };
 
-struct Match {
+struct Hit {
     std::string doc_id;
-    std::string segment_name;
+    double C{0.0}; // percent 0..100
 
-    double score{0.0};
-    double coverage_query{0.0};
-    double coverage_doc{0.0};
+    std::vector<MatchSpan> match_spans;
 
-    uint32_t hits{0};                 // raw hits (stage A)
-    uint32_t matched_shingles{0};     // sum(span.len_shingles)
+    std::string organization_id;
+    std::string external_id;
 
-    std::vector<Span> spans;
+    // segment provenance
+    std::string meta_path;     // "seg_xxx/"
+    // file provenance
+    std::string source_path;   // stored file path
+    std::string source_name;   // original file name
+
+    // small snippet
+    std::string preview;
 };
 
 struct SearchResult {
     std::string query;
     uint64_t segments_scanned{0};
-    std::vector<Match> matches;
+    std::vector<Hit> hits;
 };
 
 nlohmann::json to_json(const SearchResult& r);

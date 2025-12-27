@@ -1,7 +1,9 @@
+// Back_L5/cpp/src/validator.cpp
 #include "l5/validator.h"
 #include "l5/reader.h"
 #include "l5/manifest.h"
 #include "l5/format.h"
+#include "l5/docinfo.h"
 
 #include <filesystem>
 #include <sstream>
@@ -23,20 +25,21 @@ ValidationResult validate_segment(const std::filesystem::path& seg_dir, bool che
     ValidationResult vr;
     SegmentData seg;
     std::string err;
+
     if (!load_segment_bin(seg_dir, seg, &err)) {
         vr.errors.push_back(err);
         vr.ok = false;
         return vr;
     }
 
-    std::vector<std::string> docids;
-    if (!load_docids_json(seg_dir, docids, &err)) {
+    std::vector<DocInfo> docinfo;
+    if (!load_docids_json(seg_dir, docinfo, &err)) {
         vr.errors.push_back(err);
     }
 
-    if (docids.size() != seg.header.n_docs) {
+    if (docinfo.size() != seg.header.n_docs) {
         std::ostringstream oss;
-        oss << "docids size mismatch: docids=" << docids.size()
+        oss << "docids size mismatch: docinfo=" << docinfo.size()
             << " header.n_docs=" << seg.header.n_docs;
         vr.errors.push_back(oss.str());
     }

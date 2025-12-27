@@ -1,2 +1,0 @@
-/usr/bin/ar qc libl5_engine.a CMakeFiles/l5_engine.dir/cpp/common/text_common.cpp.o CMakeFiles/l5_engine.dir/cpp/src/format.cpp.o CMakeFiles/l5_engine.dir/cpp/src/manifest.cpp.o CMakeFiles/l5_engine.dir/cpp/src/reader.cpp.o CMakeFiles/l5_engine.dir/cpp/src/validator.cpp.o CMakeFiles/l5_engine.dir/cpp/src/builder.cpp.o CMakeFiles/l5_engine.dir/cpp/src/query.cpp.o CMakeFiles/l5_engine.dir/cpp/src/result.cpp.o CMakeFiles/l5_engine.dir/cpp/src/search_segment.cpp.o CMakeFiles/l5_engine.dir/cpp/src/search_multi.cpp.o
-/usr/bin/ranlib libl5_engine.a

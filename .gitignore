@@ -1,0 +1,32 @@
+cat >> .gitignore <<'EOF'
+# build artifacts
+build/
+build_*/
+cmake-build-*/
+out/
+dist/
+
+# C/C++ outputs
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# sanitizers / coverage
+asan.*
+ubsan.*
+*.profraw
+*.profdata
+
+# runtime/index artifacts (L5)
+DATA_ROOT_TEST/
+runtime/
+*.bin
+*.idx
+*.dat
+*.pack
+EOF
+
+git add .gitignore

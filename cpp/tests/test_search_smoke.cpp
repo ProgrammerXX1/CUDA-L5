@@ -31,9 +31,13 @@ int main() {
     l5::SearchOptions sopt;
     sopt.topk = 5;
     sopt.min_hits = 1;
+    sopt.span_min_len = 2;
+    sopt.candidates_topn = 50;
 
-    // Важно: >= 9 токенов, иначе QueryShingles пустой (K=9).
-    const std::string query = "это простой тестовый документ для шингловой системы и поиска";
+    const std::string query =
+        "Это длинный тестовый документ для шингловой системы и поиска. "
+        "Он нужен чтобы построить много шинглов k девять и проверить совпадения. "
+        "Мы специально пишем несколько предложений подряд чтобы создать устойчивые последовательности токенов.";
 
     auto r = l5::search_out_root(out_root, query, true, sopt);
 
@@ -41,13 +45,13 @@ int main() {
         std::cerr << "FAIL: segments_scanned < 1\n";
         return 2;
     }
-    if (r.matches.empty()) {
-        std::cerr << "FAIL: no matches for query: " << query << "\n";
+    if (r.hits.empty()) {
+        std::cerr << "FAIL: no hits for query: " << query << "\n";
         return 3;
     }
 
-    std::cout << "Top match: " << r.matches[0].doc_id
-              << " score=" << r.matches[0].score
-              << " hits=" << r.matches[0].hits << "\n";
+    std::cout << "Top hit: " << r.hits[0].doc_id
+              << " C=" << r.hits[0].C
+              << " spans=" << r.hits[0].match_spans.size() << "\n";
     return 0;
 }
