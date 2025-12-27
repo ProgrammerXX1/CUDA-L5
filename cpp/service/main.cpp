@@ -9,6 +9,8 @@
 #include <cctype>
 #include <ctime>
 #include <mutex>
+#include <algorithm>
+#include <cstdint>
 
 #include "httplib.h"
 #include <nlohmann/json.hpp>
@@ -115,7 +117,7 @@ static std::optional<json> find_docinfo_entry_with_did(const fs::path& docids_js
   return std::nullopt;
 }
 
-// ---- helpers for normalized_text endpoint ----
+// ---- helpers for text extraction endpoint ----
 static std::string to_lower_copy(std::string s) {
   for (char& c : s) c = (char)std::tolower((unsigned char)c);
   return s;
@@ -200,12 +202,6 @@ static size_t utf8_safe_prefix_len(std::string_view s, size_t max_bytes) {
   return last_good;
 }
 
-static std::string normalize_full_text(const std::string& raw_text) {
-  std::string norm;
-  normalize_for_shingles_simple_to(raw_text, norm);
-  return norm;
-}
-
 static fs::path convert_doc_to_txt_utf8(const fs::path& in_file, const fs::path& tmp_dir) {
   // Convert doc/docx to txt via soffice using isolated profile
   const fs::path conv_src = tmp_dir / "conv_src";
@@ -250,6 +246,36 @@ static fs::path convert_doc_to_txt_utf8(const fs::path& in_file, const fs::path&
   return out_txt;
 }
 
+static std::string trim_copy(std::string s) {
+  auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
+  size_t a = 0;
+  while (a < s.size() && is_ws((unsigned char)s[a])) ++a;
+  size_t b = s.size();
+  while (b > a && is_ws((unsigned char)s[b - 1])) --b;
+  return s.substr(a, b - a);
+}
+
+// parse bool from query/form value
+static bool parse_bool_str(const std::string& v, bool defv) {
+  std::string s = trim_copy(v);
+  if (s.empty()) return defv;
+  s = to_lower_copy(s);
+  if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
+  if (s == "0" || s == "false" || s == "no" || s == "off") return false;
+  return defv;
+}
+
+// try read param from multipart form or query params
+static std::optional<std::string> get_param_any(const httplib::Request& req, const char* key) {
+  if (req.has_param(key)) return req.get_param_value(key);
+  auto it = req.files.find(key);
+  if (it != req.files.end()) {
+    // for text fields in multipart, filename is usually empty
+    if (it->second.filename.empty()) return it->second.content;
+  }
+  return std::nullopt;
+}
+
 int main(int argc, char** argv) {
   std::string data_root = (argc >= 2) ? argv[1] : "./DATA_ROOT";
   L5Service svc{fs::path(data_root)};
@@ -261,12 +287,14 @@ int main(int argc, char** argv) {
   constexpr size_t MAX_JSON_BODY_BYTES  = 1ull * 1024 * 1024;   // 1MB
   constexpr size_t MAX_QUERY_BYTES      = 256ull * 1024;        // 256KB
 
-  // Debug endpoint hard cap (returning huge JSON is expensive)
+  // Debug endpoint hard cap
   constexpr size_t MAX_DEBUG_TEXT_BYTES_DEFAULT = 8ull * 1024 * 1024;   // 8 MiB
-  constexpr size_t MAX_DEBUG_TEXT_BYTES_HARD    = 32ull * 1024 * 1024;  // 32 MiB
+  constexpr size_t MAX_DEBUG_TEXT_BYTES_HARD    = 64ull * 1024 * 1024;  // 64 MiB
 
   // Batch ZIP: one upload => one segment
-  // POST /v1/orgs/{org}/ingest_zip  multipart: file=@batch.zip, text_is_normalized=0|1, segment_name(optional)
+  // POST /v1/orgs/{org}/ingest_zip  multipart: file=@batch.zip,
+  //   normalize=1|0 (default 1): делать нормализацию В ЯДРЕ при индексации
+  //   (legacy) text_is_normalized=1|0: если 1 -> normalize=0
   app.Post(R"(/v1/orgs/([^/]+)/ingest_zip)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
       std::string org_id = req.matches[1];
@@ -288,16 +316,34 @@ int main(int argc, char** argv) {
         return;
       }
 
-      bool text_is_normalized = false;
-      if (req.has_param("text_is_normalized")) {
-        auto v = req.get_param_value("text_is_normalized");
-        text_is_normalized = (v == "1" || v == "true");
+      // --- choose normalization at indexing stage ---
+      bool do_normalize = true;        // default = normalize
+      bool have_norm = false;
+
+      if (auto v = get_param_any(req, "normalize")) {
+        do_normalize = parse_bool_str(*v, true);
+        have_norm = true;
       }
+
+      // legacy fallback ONLY if normalize param not provided
+      if (!have_norm) {
+        if (auto v = get_param_any(req, "text_is_normalized")) {
+          const bool text_is_norm = parse_bool_str(*v, false);
+          do_normalize = !text_is_norm;
+        }
+      }
+
+      // Builder expects: text_is_normalized flag in corpus:
+      //   true  => skip normalization
+      //   false => do normalization
+      const bool text_is_normalized_flag = !do_normalize;
 
       std::string segment_name;
       if (req.has_param("segment_name")) segment_name = req.get_param_value("segment_name");
 
-      auto r = svc.ingest_zip_build_segment(org_id, f.filename, f.content, text_is_normalized, segment_name);
+      auto r = svc.ingest_zip_build_segment(org_id, f.filename, f.content,
+                                           /*text_is_normalized=*/text_is_normalized_flag,
+                                           segment_name);
 
       json docs = json::array();
       for (const auto& d : r.docs) docs.push_back(upload_to_json(d));
@@ -311,7 +357,11 @@ int main(int argc, char** argv) {
         {"strict_text_is_normalized", r.build.strict_text_is_normalized},
         {"built_at_utc", r.build.built_at_utc},
         {"ingested_docs", docs},
-        {"skipped", json::array()}
+        {"skipped", json::array()},
+
+        // echo selected mode
+        {"normalize", do_normalize ? 1 : 0},
+        {"text_is_normalized", text_is_normalized_flag ? 1 : 0}
       };
 
       for (const auto& s : r.skipped) {
@@ -330,7 +380,10 @@ int main(int argc, char** argv) {
     }
   });
 
-  // Search
+  // Search: ядро НЕ нормализует запрос. Ищем "как ввели".
+  // Чтобы был матч, query должен быть в ТОЙ ЖЕ ФОРМЕ, что и индекс:
+  //   - индексировали normalize=1 => query должен быть нормализован тем же алгоритмом
+  //   - индексировали normalize=0 => query должен быть raw
   app.Post(R"(/v1/orgs/([^/]+)/search)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
       std::string org_id = req.matches[1];
@@ -354,7 +407,8 @@ int main(int argc, char** argv) {
         return;
       }
 
-      bool query_is_normalized = j.value("query_is_normalized", false);
+      // IMPORTANT: do NOT normalize query inside core
+      const bool query_is_normalized = true;
 
       l5::SearchOptions opt;
       opt.topk = j.value("topk", opt.topk);
@@ -503,7 +557,7 @@ int main(int argc, char** argv) {
           {"n_post9", h.n_post9},
           {"n_post13", h.n_post13}
         }},
-        {"note", "Full normalized text is not stored in segment; only preview_text + postings/docmeta."}
+        {"note", "Full text is not stored in segment; only preview_text + postings/docmeta. Use /debug/normalized_text to re-extract full text from file."}
       };
 
       reply_json(res, 200, out);
@@ -514,8 +568,11 @@ int main(int argc, char** argv) {
     }
   });
 
-  // NEW: вернуть полный НОРМАЛИЗОВАННЫЙ текст по имени файла (external_id / doc_id)
-  // GET /v1/orgs/{org}/debug/normalized_text?name=<external_id_or_doc_id>&max_bytes=8388608
+  // DEBUG: открыть выбранный файл и вернуть его текст.
+  // normalize=0 -> вернуть RAW (как в файле/после конвертации)
+  // normalize=1 -> вернуть NORMALIZED (как индексировали при normalize=1)
+  //
+  // GET /v1/orgs/{org}/debug/normalized_text?name=<external_id_or_doc_id>&normalize=0|1&max_bytes=...
   app.Get(R"(/v1/orgs/([^/]+)/debug/normalized_text)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
       std::string org_id = req.matches[1];
@@ -525,6 +582,11 @@ int main(int argc, char** argv) {
         return;
       }
       const std::string name = req.get_param_value("name");
+
+      bool do_normalize = false; // default RAW
+      if (req.has_param("normalize")) {
+        do_normalize = parse_bool_str(req.get_param_value("normalize"), false);
+      }
 
       size_t max_bytes = MAX_DEBUG_TEXT_BYTES_DEFAULT;
       if (req.has_param("max_bytes")) {
@@ -570,12 +632,19 @@ int main(int argc, char** argv) {
         return;
       }
 
-      std::string norm = normalize_full_text(ex.text);
+      const uint64_t raw_bytes = (uint64_t)ex.text.size();
+
+      std::string out_text;
+      if (do_normalize) {
+        normalize_for_shingles_simple_to(ex.text, out_text);
+      } else {
+        out_text = std::move(ex.text);
+      }
 
       bool truncated = false;
-      if (norm.size() > max_bytes) {
-        const size_t cut = utf8_safe_prefix_len(norm, max_bytes);
-        norm.resize(cut);
+      if (out_text.size() > max_bytes) {
+        const size_t cut = utf8_safe_prefix_len(out_text, max_bytes);
+        out_text.resize(cut);
         truncated = true;
       }
 
@@ -588,11 +657,14 @@ int main(int argc, char** argv) {
         {"source_path", row.source_path},
         {"stored_path", row.stored_path},
         {"last_segment", row.last_segment},
-        {"raw_bytes", (uint64_t)ex.text.size()},
-        {"normalized_bytes", (uint64_t)norm.size()},
+
+        {"normalize", do_normalize ? 1 : 0},
+        {"raw_bytes", raw_bytes},
+        {"returned_bytes", (uint64_t)out_text.size()},
         {"max_bytes", (uint64_t)max_bytes},
         {"truncated", truncated},
-        {"text_normalized", norm}
+
+        {"text", out_text}
       };
 
       reply_json(res, 200, out);
@@ -603,7 +675,7 @@ int main(int argc, char** argv) {
     }
   });
 
-  // NEW ADMIN: wipe ALL базы загруженных файлов (orgs/*)
+  // ADMIN: wipe ALL базы загруженных файлов (orgs/*)
   // POST /v1/admin/wipe_all  body: {"confirm":"WIPE_ALL"}  (или query ?confirm=WIPE_ALL)
   app.Post(R"(/v1/admin/wipe_all)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
@@ -660,7 +732,7 @@ int main(int argc, char** argv) {
     }
   });
 
-  // NEW ADMIN: wipe ONE org полностью (uploads/index/meta.sqlite/tombstones)
+  // ADMIN: wipe ONE org полностью
   // POST /v1/orgs/{org}/admin/wipe  body: {"confirm":"WIPE_ORG"}  (или query ?confirm=WIPE_ORG)
   app.Post(R"(/v1/orgs/([^/]+)/admin/wipe)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
@@ -685,7 +757,6 @@ int main(int argc, char** argv) {
         return;
       }
 
-      // минимальная защита от path traversal
       if (org_id.find("..") != std::string::npos) {
         reply_json(res, 400, {{"error","bad org_id"}});
         return;
