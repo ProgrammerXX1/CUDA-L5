@@ -12,7 +12,17 @@ nlohmann::json to_json(const SearchResult& r) {
     for (const auto& h : r.hits) {
         nlohmann::json e;
         e["doc_id"] = h.doc_id;
-        e["C"] = h.C;
+
+        // scores
+        e["C"] = h.C;     // mixed similarity
+        e["Cq"] = h.Cq;   // query coverage
+        e["Cd"] = h.Cd;   // doc coverage
+        e["alpha"] = h.alpha;
+
+        // explainability
+        e["matched_shingles"] = h.matched_shingles;
+        e["q_total"] = h.q_total;
+        e["d_total"] = h.d_total;
 
         nlohmann::json sp = nlohmann::json::array();
         for (const auto& s : h.match_spans) {

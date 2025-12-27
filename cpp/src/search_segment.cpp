@@ -3,9 +3,11 @@
 #include "l5/format.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace l5 {
@@ -163,7 +165,7 @@ std::vector<Hit> search_in_segment(
     const uint32_t topN = std::min<uint32_t>(opt.candidates_topn, (uint32_t)cand.size());
     if (topN == 0) return out;
 
-    // FIX: nth_element требует nth в [begin, end), а не == end.
+    // nth_element требует nth в [begin, end), а не == end
     if (cand.size() > topN) {
         std::nth_element(
             cand.begin(), cand.begin() + topN, cand.end(),
@@ -171,7 +173,6 @@ std::vector<Hit> search_in_segment(
         );
         cand.resize(topN);
     } else {
-        // cand.size() == topN => оставляем как есть
         cand.resize(topN);
     }
 
@@ -247,9 +248,16 @@ std::vector<Hit> search_in_segment(
 
         h.source_path = di.source_path;
         h.source_name = di.source_name;
-
         h.preview = di.preview_text;
-        h.C = score * 100.0;
+
+        // debug metrics / explainability
+        h.alpha = opt.alpha;
+        h.matched_shingles = matched;
+        h.q_total = q_total;
+        h.d_total = d_total;
+        h.Cq = cov_q * 100.0;
+        h.Cd = cov_d * 100.0;
+        h.C  = score * 100.0;
 
         h.match_spans.reserve(spans.size());
         for (const auto& s : spans) {

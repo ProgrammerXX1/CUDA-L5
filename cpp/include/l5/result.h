@@ -17,20 +17,28 @@ struct MatchSpan {
 
 struct Hit {
     std::string doc_id;
+
+    // Итоговая метрика (как сейчас)
     double C{0.0}; // percent 0..100
+
+    // Новые метрики:
+    double Cq{0.0}; // percent 0..100 (coverage query)
+    double Cd{0.0}; // percent 0..100 (coverage doc)
+
+    uint32_t matched_shingles{0}; // сумма len_shingles по spans
+    uint32_t q_total{0};          // q.total_shingles
+    uint32_t d_total{0};          // doc_shingles_count(tok_len)
+    double   alpha{0.0};          // фактически использованный alpha
 
     std::vector<MatchSpan> match_spans;
 
     std::string organization_id;
     std::string external_id;
 
-    // segment provenance
-    std::string meta_path;     // "seg_xxx/"
-    // file provenance
-    std::string source_path;   // stored file path
-    std::string source_name;   // original file name
+    std::string meta_path;
+    std::string source_path;
+    std::string source_name;
 
-    // small snippet
     std::string preview;
 };
 

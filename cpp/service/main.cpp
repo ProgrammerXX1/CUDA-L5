@@ -2,14 +2,27 @@
 #include <iostream>
 #include <filesystem>
 #include <stdexcept>
+#include <fstream>
+#include <optional>
+#include <string>
+#include <cstdlib>
+#include <cctype>
+#include <ctime>
+#include <mutex>
 
 #include "httplib.h"
 #include <nlohmann/json.hpp>
 
 #include "service.h"
 #include "l5/result.h"
+#include "l5/format.h"
+
+#include "storage.h"
+#include "extractor.h"
+#include "text_common.h"
 
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 static json doc_to_json(const DocRow& d) {
   return {
@@ -39,12 +52,207 @@ static json upload_to_json(const UploadResult& r) {
 
 static void reply_json(httplib::Response& res, int status, const json& j) {
   res.status = status;
-  res.set_content(j.dump(), "application/json");
+  res.set_content(j.dump(), "application/json; charset=utf-8");
+}
+
+// admin/wipe mutex
+static std::mutex g_admin_mu;
+
+// ---- helpers for debug index view ----
+static bool read_docmeta_by_did(const fs::path& bin_path,
+                                uint32_t did,
+                                l5::HeaderV2& hdr_out,
+                                l5::DocMeta& dm_out,
+                                std::string& err) {
+  std::ifstream in(bin_path, std::ios::binary);
+  if (!in) { err = "cannot open " + bin_path.string(); return false; }
+
+  l5::HeaderV2 h{};
+  if (!l5::read_header_v2(in, h)) { err = "invalid header in " + bin_path.string(); return false; }
+  if (did >= h.n_docs) { err = "did out of range"; return false; }
+
+  // header bytes: 4+4+4+8+8 = 28
+  constexpr std::streamoff HDR_BYTES = 4 + 4 + 4 + 8 + 8;
+  // docmeta bytes: tok_len(4) + hi(8) + lo(8) = 20
+  constexpr std::streamoff DOCMETA_BYTES = 4 + 8 + 8;
+
+  const std::streamoff off = HDR_BYTES + (std::streamoff)did * DOCMETA_BYTES;
+  in.seekg(off, std::ios::beg);
+  if (!in) { err = "seek failed"; return false; }
+
+  l5::DocMeta dm{};
+  in.read(reinterpret_cast<char*>(&dm.tok_len), sizeof(dm.tok_len));
+  in.read(reinterpret_cast<char*>(&dm.simhash_hi), sizeof(dm.simhash_hi));
+  in.read(reinterpret_cast<char*>(&dm.simhash_lo), sizeof(dm.simhash_lo));
+  if (!in) { err = "read docmeta failed"; return false; }
+
+  hdr_out = h;
+  dm_out = dm;
+  return true;
+}
+
+static std::optional<json> find_docinfo_entry_with_did(const fs::path& docids_json,
+                                                       const std::string& doc_id,
+                                                       uint32_t& did_out,
+                                                       std::string& err) {
+  std::ifstream in(docids_json);
+  if (!in) { err = "cannot open " + docids_json.string(); return std::nullopt; }
+
+  json j;
+  try { in >> j; } catch (...) { err = "failed parsing " + docids_json.string(); return std::nullopt; }
+  if (!j.is_array()) { err = "docids json is not array"; return std::nullopt; }
+
+  for (size_t i = 0; i < j.size(); ++i) {
+    if (!j[i].is_object()) continue;
+    const std::string id = j[i].value("doc_id", "");
+    if (id == doc_id) {
+      did_out = (uint32_t)i;
+      return j[i];
+    }
+  }
+
+  err = "doc_id not found in docids.json";
+  return std::nullopt;
+}
+
+// ---- helpers for normalized_text endpoint ----
+static std::string to_lower_copy(std::string s) {
+  for (char& c : s) c = (char)std::tolower((unsigned char)c);
+  return s;
+}
+
+static std::string lower_ext(const fs::path& p) {
+  return to_lower_copy(p.extension().string());
+}
+
+static void ensure_dirs(const fs::path& p) {
+  std::error_code ec;
+  fs::create_directories(p, ec);
+  if (ec) throw std::runtime_error("mkdir failed: " + p.string() + " err=" + ec.message());
+}
+
+static std::string shell_quote(const std::string& s) {
+  // single-quote safe for bash: ' -> '\''
+  std::string out;
+  out.reserve(s.size() + 8);
+  out.push_back('\'');
+  for (char c : s) {
+    if (c == '\'') out += "'\\''";
+    else out.push_back(c);
+  }
+  out.push_back('\'');
+  return out;
+}
+
+static int run_cmd_bash(const std::string& cmd) {
+  std::string full = "bash -lc " + shell_quote(cmd);
+  return std::system(full.c_str());
+}
+
+static fs::path mk_tmp_dir() {
+  const auto base = fs::temp_directory_path();
+  const uint64_t t = (uint64_t)std::time(nullptr);
+  for (int i = 0; i < 200; ++i) {
+    fs::path p = base / ("l5_dbg_" + std::to_string(t) + "_" + std::to_string(i));
+    std::error_code ec;
+    if (fs::create_directories(p, ec) && !ec) return p;
+  }
+  throw std::runtime_error("cannot create temp dir");
+}
+
+struct CleanupDir {
+  fs::path p;
+  ~CleanupDir() {
+    if (p.empty()) return;
+    std::error_code ec;
+    fs::remove_all(p, ec);
+  }
+};
+
+// UTF-8 safe prefix boundary
+static size_t utf8_safe_prefix_len(std::string_view s, size_t max_bytes) {
+  const size_t n = std::min(max_bytes, s.size());
+  size_t i = 0;
+  size_t last_good = 0;
+
+  while (i < n) {
+    const unsigned char c = (unsigned char)s[i];
+
+    size_t len = 1;
+    if (c < 0x80) len = 1;
+    else if (c >= 0xC2 && c <= 0xDF) len = 2;
+    else if (c >= 0xE0 && c <= 0xEF) len = 3;
+    else if (c >= 0xF0 && c <= 0xF4) len = 4;
+    else break;
+
+    if (i + len > n) break;
+
+    bool ok = true;
+    for (size_t j = 1; j < len; ++j) {
+      const unsigned char cc = (unsigned char)s[i + j];
+      if ((cc & 0xC0) != 0x80) { ok = false; break; }
+    }
+    if (!ok) break;
+
+    i += len;
+    last_good = i;
+  }
+  return last_good;
+}
+
+static std::string normalize_full_text(const std::string& raw_text) {
+  std::string norm;
+  normalize_for_shingles_simple_to(raw_text, norm);
+  return norm;
+}
+
+static fs::path convert_doc_to_txt_utf8(const fs::path& in_file, const fs::path& tmp_dir) {
+  // Convert doc/docx to txt via soffice using isolated profile
+  const fs::path conv_src = tmp_dir / "conv_src";
+  const fs::path conv_out = tmp_dir / "conv_out";
+  const fs::path lo_profile = tmp_dir / "lo_profile";
+  ensure_dirs(conv_src);
+  ensure_dirs(conv_out);
+  ensure_dirs(lo_profile);
+
+  const fs::path unique_in = conv_src / in_file.filename();
+  {
+    std::ifstream in(in_file, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot read: " + in_file.string());
+    std::ofstream out(unique_in, std::ios::binary);
+    if (!out) throw std::runtime_error("cannot write: " + unique_in.string());
+    out << in.rdbuf();
+    out.flush();
+    if (!out) throw std::runtime_error("copy failed: " + unique_in.string());
+  }
+
+  const fs::path abs_profile = fs::absolute(lo_profile);
+  std::string profile_uri = "file://" + abs_profile.string();
+
+  std::string cmd =
+    "soffice --headless --nologo --nolockcheck --nodefault --norestore"
+    " -env:UserInstallation=" + shell_quote(profile_uri) +
+    " --convert-to " + shell_quote("txt:Text (encoded):UTF8") +
+    " --outdir " + shell_quote(conv_out.string()) + " " +
+    shell_quote(unique_in.string());
+
+  const int rc = run_cmd_bash(cmd);
+  if (rc != 0) throw std::runtime_error("soffice convert failed rc=" + std::to_string(rc));
+
+  const fs::path out_txt = conv_out / (unique_in.stem().string() + ".txt");
+  if (!fs::exists(out_txt)) {
+    // sometimes soffice changes name; try find any .txt in outdir
+    for (auto it = fs::directory_iterator(conv_out); it != fs::directory_iterator(); ++it) {
+      if (it->is_regular_file() && lower_ext(it->path()) == ".txt") return it->path();
+    }
+    throw std::runtime_error("soffice produced no .txt in " + conv_out.string());
+  }
+  return out_txt;
 }
 
 int main(int argc, char** argv) {
   std::string data_root = (argc >= 2) ? argv[1] : "./DATA_ROOT";
-  L5Service svc{std::filesystem::path(data_root)};
+  L5Service svc{fs::path(data_root)};
 
   httplib::Server app;
 
@@ -52,6 +260,10 @@ int main(int argc, char** argv) {
   constexpr size_t MAX_ZIP_UPLOAD_BYTES = 512ull * 1024 * 1024; // 512MB
   constexpr size_t MAX_JSON_BODY_BYTES  = 1ull * 1024 * 1024;   // 1MB
   constexpr size_t MAX_QUERY_BYTES      = 256ull * 1024;        // 256KB
+
+  // Debug endpoint hard cap (returning huge JSON is expensive)
+  constexpr size_t MAX_DEBUG_TEXT_BYTES_DEFAULT = 8ull * 1024 * 1024;   // 8 MiB
+  constexpr size_t MAX_DEBUG_TEXT_BYTES_HARD    = 32ull * 1024 * 1024;  // 32 MiB
 
   // Batch ZIP: one upload => one segment
   // POST /v1/orgs/{org}/ingest_zip  multipart: file=@batch.zip, text_is_normalized=0|1, segment_name(optional)
@@ -132,15 +344,11 @@ int main(int argc, char** argv) {
       try {
         j = json::parse(req.body);
       } catch (...) {
-        reply_json(res, 400, {{"error","invalid json"}});
-        return;
+        reply_json(res, 400, {{"error","invalid json"}}); return;
       }
 
       std::string query = j.value("query", "");
-      if (query.empty()) {
-        reply_json(res, 400, {{"error","query is empty"}});
-        return;
-      }
+      if (query.empty()) { reply_json(res, 400, {{"error","query is empty"}}); return; }
       if (query.size() > MAX_QUERY_BYTES) {
         reply_json(res, 413, {{"error","query too large"}, {"max_bytes", (uint64_t)MAX_QUERY_BYTES}});
         return;
@@ -207,6 +415,312 @@ int main(int argc, char** argv) {
       reply_json(res, 200, {{"ok", true}});
     } catch (const std::invalid_argument& e) {
       reply_json(res, 400, {{"error", e.what()}});
+    } catch (const std::exception& e) {
+      reply_json(res, 500, {{"error", e.what()}});
+    }
+  });
+
+  // Debug: показать как документ лежит в сегменте (DocInfo + did + docmeta)
+  // GET /v1/orgs/{org}/debug/index_view?key=<doc_id|external_id>&max_preview=4000
+  app.Get(R"(/v1/orgs/([^/]+)/debug/index_view)", [&](const httplib::Request& req, httplib::Response& res) {
+    try {
+      std::string org_id = req.matches[1];
+
+      if (!req.has_param("key")) {
+        reply_json(res, 400, {{"error","missing key param (doc_id or external_id)"}});
+        return;
+      }
+      const std::string key = req.get_param_value("key");
+
+      int max_preview = 2000;
+      if (req.has_param("max_preview")) {
+        max_preview = std::stoi(req.get_param_value("max_preview"));
+        if (max_preview < 200) max_preview = 200;
+        if (max_preview > 200000) max_preview = 200000;
+      }
+
+      const fs::path org_dir = fs::path(data_root) / "orgs" / org_id;
+      const fs::path sqlite_path = org_dir / "meta.sqlite";
+      const fs::path index_root  = org_dir / "index";
+
+      Storage st(sqlite_path.string());
+      st.init();
+
+      auto row_opt = st.get_by_doc_or_external(org_id, key);
+      if (!row_opt) {
+        reply_json(res, 404, {{"error","document not found"}, {"key", key}});
+        return;
+      }
+      const DocRow& row = *row_opt;
+
+      if (row.last_segment.empty()) {
+        reply_json(res, 400, {{"error","document has no last_segment (not indexed yet)"}, {"doc_id", row.doc_id}});
+        return;
+      }
+
+      const fs::path seg_dir = index_root / row.last_segment;
+      const auto docids_path = seg_dir / "index_native_docids.json";
+      const auto bin_path    = seg_dir / "index_native.bin";
+
+      uint32_t did = 0;
+      std::string err;
+      auto docinfo_opt = find_docinfo_entry_with_did(docids_path, row.doc_id, did, err);
+      if (!docinfo_opt) {
+        reply_json(res, 500, {{"error","failed reading docids"}, {"detail", err}, {"seg_dir", seg_dir.string()}});
+        return;
+      }
+      json docinfo = *docinfo_opt;
+
+      if (docinfo.contains("preview_text") && docinfo["preview_text"].is_string()) {
+        std::string pv = docinfo["preview_text"].get<std::string>();
+        if ((int)pv.size() > max_preview) pv.resize((size_t)max_preview);
+        docinfo["preview_text"] = pv;
+      }
+
+      l5::HeaderV2 h{};
+      l5::DocMeta dm{};
+      if (!read_docmeta_by_did(bin_path, did, h, dm, err)) {
+        reply_json(res, 500, {{"error","failed reading docmeta"}, {"detail", err}, {"bin", bin_path.string()}});
+        return;
+      }
+
+      json out = {
+        {"org_id", org_id},
+        {"key", key},
+        {"doc", doc_to_json(row)},
+        {"segment_name", row.last_segment},
+        {"seg_dir", seg_dir.string()},
+        {"did", did},
+        {"docinfo", docinfo},
+        {"docmeta", {
+          {"tok_len", dm.tok_len},
+          {"simhash_hi", dm.simhash_hi},
+          {"simhash_lo", dm.simhash_lo}
+        }},
+        {"header", {
+          {"version", h.version},
+          {"n_docs", h.n_docs},
+          {"n_post9", h.n_post9},
+          {"n_post13", h.n_post13}
+        }},
+        {"note", "Full normalized text is not stored in segment; only preview_text + postings/docmeta."}
+      };
+
+      reply_json(res, 200, out);
+    } catch (const std::invalid_argument& e) {
+      reply_json(res, 400, {{"error", e.what()}});
+    } catch (const std::exception& e) {
+      reply_json(res, 500, {{"error", e.what()}});
+    }
+  });
+
+  // NEW: вернуть полный НОРМАЛИЗОВАННЫЙ текст по имени файла (external_id / doc_id)
+  // GET /v1/orgs/{org}/debug/normalized_text?name=<external_id_or_doc_id>&max_bytes=8388608
+  app.Get(R"(/v1/orgs/([^/]+)/debug/normalized_text)", [&](const httplib::Request& req, httplib::Response& res) {
+    try {
+      std::string org_id = req.matches[1];
+
+      if (!req.has_param("name")) {
+        reply_json(res, 400, {{"error","missing name param (external_id or doc_id)"}});
+        return;
+      }
+      const std::string name = req.get_param_value("name");
+
+      size_t max_bytes = MAX_DEBUG_TEXT_BYTES_DEFAULT;
+      if (req.has_param("max_bytes")) {
+        long long v = std::stoll(req.get_param_value("max_bytes"));
+        if (v < 0) v = 0;
+        max_bytes = (size_t)v;
+        if (max_bytes == 0) max_bytes = MAX_DEBUG_TEXT_BYTES_DEFAULT;
+        if (max_bytes > MAX_DEBUG_TEXT_BYTES_HARD) max_bytes = MAX_DEBUG_TEXT_BYTES_HARD;
+      }
+
+      const fs::path org_dir = fs::path(data_root) / "orgs" / org_id;
+      const fs::path sqlite_path = org_dir / "meta.sqlite";
+
+      Storage st(sqlite_path.string());
+      st.init();
+
+      auto row_opt = st.get_by_doc_or_external(org_id, name);
+      if (!row_opt) {
+        reply_json(res, 404, {{"error","document not found"}, {"name", name}});
+        return;
+      }
+      const DocRow& row = *row_opt;
+
+      fs::path src = row.stored_path.empty() ? row.source_path : row.stored_path;
+      if (src.empty()) {
+        reply_json(res, 500, {{"error","stored_path/source_path empty"}, {"doc_id", row.doc_id}});
+        return;
+      }
+
+      const std::string ext = lower_ext(src);
+
+      ExtractedText ex;
+      if (ext == ".txt") {
+        ex = extract_text_from_file(src, /*assume_normalized=*/false);
+      } else if (ext == ".doc" || ext == ".docx") {
+        fs::path tmp = mk_tmp_dir();
+        CleanupDir cleanup{tmp};
+
+        fs::path txt_path = convert_doc_to_txt_utf8(src, tmp);
+        ex = extract_text_from_file(txt_path, /*assume_normalized=*/false);
+      } else {
+        reply_json(res, 400, {{"error","unsupported file type"}, {"ext", ext}, {"path", src.string()}});
+        return;
+      }
+
+      std::string norm = normalize_full_text(ex.text);
+
+      bool truncated = false;
+      if (norm.size() > max_bytes) {
+        const size_t cut = utf8_safe_prefix_len(norm, max_bytes);
+        norm.resize(cut);
+        truncated = true;
+      }
+
+      json out = {
+        {"org_id", org_id},
+        {"name", name},
+        {"doc_id", row.doc_id},
+        {"external_id", row.external_id},
+        {"source_name", row.source_name},
+        {"source_path", row.source_path},
+        {"stored_path", row.stored_path},
+        {"last_segment", row.last_segment},
+        {"raw_bytes", (uint64_t)ex.text.size()},
+        {"normalized_bytes", (uint64_t)norm.size()},
+        {"max_bytes", (uint64_t)max_bytes},
+        {"truncated", truncated},
+        {"text_normalized", norm}
+      };
+
+      reply_json(res, 200, out);
+    } catch (const std::invalid_argument& e) {
+      reply_json(res, 400, {{"error", e.what()}});
+    } catch (const std::exception& e) {
+      reply_json(res, 500, {{"error", e.what()}});
+    }
+  });
+
+  // NEW ADMIN: wipe ALL базы загруженных файлов (orgs/*)
+  // POST /v1/admin/wipe_all  body: {"confirm":"WIPE_ALL"}  (или query ?confirm=WIPE_ALL)
+  app.Post(R"(/v1/admin/wipe_all)", [&](const httplib::Request& req, httplib::Response& res) {
+    try {
+      std::string confirm;
+
+      if (!req.body.empty()) {
+        if (req.body.size() > MAX_JSON_BODY_BYTES) {
+          reply_json(res, 413, {{"error","json body too large"}, {"max_bytes",(uint64_t)MAX_JSON_BODY_BYTES}});
+          return;
+        }
+        json j;
+        try { j = json::parse(req.body); }
+        catch (...) { reply_json(res, 400, {{"error","invalid json"}}); return; }
+        confirm = j.value("confirm", "");
+      } else if (req.has_param("confirm")) {
+        confirm = req.get_param_value("confirm");
+      }
+
+      if (confirm != "WIPE_ALL") {
+        reply_json(res, 400, {{"error","confirm required"}, {"expected","WIPE_ALL"}});
+        return;
+      }
+
+      std::lock_guard<std::mutex> lk(g_admin_mu);
+
+      const fs::path orgs_dir = fs::path(data_root) / "orgs";
+      std::error_code ec;
+
+      uintmax_t removed = 0;
+      if (fs::exists(orgs_dir, ec)) {
+        ec.clear();
+        removed = fs::remove_all(orgs_dir, ec);
+        if (ec) {
+          reply_json(res, 500, {{"error","remove_all failed"}, {"path", orgs_dir.string()}, {"detail", ec.message()}});
+          return;
+        }
+      }
+
+      ec.clear();
+      fs::create_directories(orgs_dir, ec);
+      if (ec) {
+        reply_json(res, 500, {{"error","create_directories failed"}, {"path", orgs_dir.string()}, {"detail", ec.message()}});
+        return;
+      }
+
+      reply_json(res, 200, {
+        {"ok", true},
+        {"wiped", "ALL"},
+        {"orgs_dir", orgs_dir.string()},
+        {"removed_entries", (uint64_t)removed}
+      });
+    } catch (const std::exception& e) {
+      reply_json(res, 500, {{"error", e.what()}});
+    }
+  });
+
+  // NEW ADMIN: wipe ONE org полностью (uploads/index/meta.sqlite/tombstones)
+  // POST /v1/orgs/{org}/admin/wipe  body: {"confirm":"WIPE_ORG"}  (или query ?confirm=WIPE_ORG)
+  app.Post(R"(/v1/orgs/([^/]+)/admin/wipe)", [&](const httplib::Request& req, httplib::Response& res) {
+    try {
+      std::string org_id = req.matches[1];
+      std::string confirm;
+
+      if (!req.body.empty()) {
+        if (req.body.size() > MAX_JSON_BODY_BYTES) {
+          reply_json(res, 413, {{"error","json body too large"}, {"max_bytes",(uint64_t)MAX_JSON_BODY_BYTES}});
+          return;
+        }
+        json j;
+        try { j = json::parse(req.body); }
+        catch (...) { reply_json(res, 400, {{"error","invalid json"}}); return; }
+        confirm = j.value("confirm", "");
+      } else if (req.has_param("confirm")) {
+        confirm = req.get_param_value("confirm");
+      }
+
+      if (confirm != "WIPE_ORG") {
+        reply_json(res, 400, {{"error","confirm required"}, {"expected","WIPE_ORG"}});
+        return;
+      }
+
+      // минимальная защита от path traversal
+      if (org_id.find("..") != std::string::npos) {
+        reply_json(res, 400, {{"error","bad org_id"}});
+        return;
+      }
+
+      std::lock_guard<std::mutex> lk(g_admin_mu);
+
+      const fs::path org_dir  = fs::path(data_root) / "orgs" / org_id;
+      const fs::path orgs_dir = fs::path(data_root) / "orgs";
+      std::error_code ec;
+
+      uintmax_t removed = 0;
+      if (fs::exists(org_dir, ec)) {
+        ec.clear();
+        removed = fs::remove_all(org_dir, ec);
+        if (ec) {
+          reply_json(res, 500, {{"error","remove_all failed"}, {"path", org_dir.string()}, {"detail", ec.message()}});
+          return;
+        }
+      }
+
+      ec.clear();
+      fs::create_directories(orgs_dir, ec);
+      if (ec) {
+        reply_json(res, 500, {{"error","create_directories failed"}, {"path", orgs_dir.string()}, {"detail", ec.message()}});
+        return;
+      }
+
+      reply_json(res, 200, {
+        {"ok", true},
+        {"wiped", "ORG"},
+        {"org_id", org_id},
+        {"org_dir", org_dir.string()},
+        {"removed_entries", (uint64_t)removed}
+      });
     } catch (const std::exception& e) {
       reply_json(res, 500, {{"error", e.what()}});
     }
