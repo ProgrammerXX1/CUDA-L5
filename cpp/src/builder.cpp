@@ -1,4 +1,3 @@
-// Back_L5/cpp/src/builder.cpp
 #include "l5/builder.h"
 #include "l5/format.h"
 #include "l5/manifest.h"
@@ -16,6 +15,7 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <queue>
 #include <sstream>
@@ -356,20 +356,49 @@ struct SegCleanupOnFail {
     }
 };
 
-// acquire did with max_docs cap (lock-free)
-static bool acquire_did(std::atomic<uint32_t>& next_did, uint32_t max_docs, uint32_t& out_did) {
-    if (max_docs == 0) {
-        out_did = next_did.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-    uint32_t cur = next_did.load(std::memory_order_relaxed);
+// --------------------
+// did window gate: bounded writer reorder buffer
+// --------------------
+struct DidGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::atomic<uint32_t> committed{0}; // writer "expect" after commit
+};
+
+static bool acquire_did_window(std::atomic<uint32_t>& next_did,
+                               uint32_t max_docs,
+                               DidGate& gate,
+                               uint32_t window,
+                               std::atomic<bool>& stop,
+                               uint32_t& out_did) {
+    if (window == 0) window = 1;
+
     while (true) {
-        if (cur >= max_docs) return false;
-        if (next_did.compare_exchange_weak(cur, cur + 1, std::memory_order_relaxed)) {
-            out_did = cur;
-            return true;
+        if (stop.load(std::memory_order_relaxed)) return false;
+
+        const uint32_t committed = gate.committed.load(std::memory_order_acquire);
+        uint32_t cur = next_did.load(std::memory_order_relaxed);
+
+        if (max_docs != 0 && cur >= max_docs) return false;
+
+        // if window has room => try allocate did
+        if ((cur - committed) < window) {
+            if (next_did.compare_exchange_weak(cur, cur + 1, std::memory_order_relaxed)) {
+                out_did = cur;
+                return true;
+            }
+            continue;
         }
-        // cur updated by compare_exchange_weak
+
+        // window full => wait for writer commit
+        std::unique_lock<std::mutex> lk(gate.mu);
+        gate.cv.wait(lk, [&] {
+            if (stop.load(std::memory_order_relaxed)) return true;
+            const uint32_t c = gate.committed.load(std::memory_order_acquire);
+            const uint32_t n = next_did.load(std::memory_order_relaxed);
+            if (max_docs != 0 && n >= max_docs) return true;
+            return (n - c) < window;
+        });
     }
 }
 
@@ -591,6 +620,7 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
     if (opt.inflight_docs == 0) {
         opt.inflight_docs = std::max<uint32_t>(32u, (uint32_t)(num_threads * 4u));
     }
+    const uint32_t window = std::max<uint32_t>(1u, opt.inflight_docs);
 
     // temp paths
     const fs::path bin_fin  = seg_dir / "index_native.bin";
@@ -616,91 +646,151 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
     }
 
     // bounded queues
-    BoundedQueue<std::string> q_lines(opt.inflight_docs);
-    BoundedQueue<DocResult>   q_docs(opt.inflight_docs);
+    BoundedQueue<std::string> q_lines(window);
+    BoundedQueue<DocResult>   q_docs(window);
 
     std::atomic<uint32_t> next_did{0};
     std::atomic<bool> stop{false};
 
+    DidGate did_gate;
+    did_gate.committed.store(0, std::memory_order_relaxed);
+
+    // error propagation (no std::terminate from threads)
+    std::mutex err_mu;
+    std::exception_ptr err_ptr = nullptr;
+
+    auto set_error = [&](std::exception_ptr e) {
+        {
+            std::lock_guard<std::mutex> lk(err_mu);
+            if (!err_ptr) err_ptr = e;
+        }
+        stop.store(true, std::memory_order_relaxed);
+        q_lines.close();
+        q_docs.close();
+        did_gate.cv.notify_all();
+    };
+
     std::vector<std::atomic<uint64_t>> postings_written(num_threads);
     for (auto& x : postings_written) x.store(0);
 
-    // writer thread: docmeta + docids.json streaming in did order
+    // writer thread: docmeta + docids.json streaming in did order (bounded ring, no unordered_map)
     std::atomic<uint32_t> docs_written{0};
 
     std::thread writer([&](){
-        std::ofstream dm(docmeta_tmp, std::ios::binary);
-        if (!dm) throw L5Exception("cannot open docmeta tmp: " + docmeta_tmp.string());
+        try {
+            std::ofstream dm(docmeta_tmp, std::ios::binary);
+            if (!dm) throw L5Exception("cannot open docmeta tmp: " + docmeta_tmp.string());
 
-        std::ofstream dj(doc_tmp, std::ios::binary);
-        if (!dj) throw L5Exception("cannot open docids tmp: " + doc_tmp.string());
+            std::ofstream dj(doc_tmp, std::ios::binary);
+            if (!dj) throw L5Exception("cannot open docids tmp: " + doc_tmp.string());
 
-        dj.put('[');
-        bool first = true;
+            const std::string meta_path_prefix = segment_name + "/";
 
-        uint32_t expect = 0;
-        std::unordered_map<uint32_t, DocResult> pending;
-        pending.reserve((size_t)opt.inflight_docs * 2);
+            dj.put('[');
+            bool first = true;
 
-        DocResult r;
-        while (q_docs.pop(r)) {
-            pending.emplace(r.did, std::move(r));
+            // ring buffer sized by window; slots keep capacity (avoid allocs)
+            std::vector<DocResult> ring(window);
+            std::vector<uint32_t>  ring_did(window, std::numeric_limits<uint32_t>::max());
 
-            while (true) {
-                auto it = pending.find(expect);
-                if (it == pending.end()) break;
+            uint32_t expect = 0;
 
-                DocResult cur = std::move(it->second);
-                pending.erase(it);
+            DocResult r;
+            while (q_docs.pop(r)) {
+                if (r.did < expect) {
+                    // shouldn't happen; ignore
+                    continue;
+                }
+                const uint32_t delta = r.did - expect;
+                if (delta >= window) {
+                    throw L5Exception("writer ring overflow: did=" + std::to_string(r.did) +
+                                      " expect=" + std::to_string(expect) +
+                                      " window=" + std::to_string(window));
+                }
 
-                // docmeta: write by fields (padding-safe)
-                dm.write(reinterpret_cast<const char*>(&cur.meta.tok_len), sizeof(cur.meta.tok_len));
-                dm.write(reinterpret_cast<const char*>(&cur.meta.simhash_hi), sizeof(cur.meta.simhash_hi));
-                dm.write(reinterpret_cast<const char*>(&cur.meta.simhash_lo), sizeof(cur.meta.simhash_lo));
+                const uint32_t slot = r.did % window;
+                if (ring_did[slot] != std::numeric_limits<uint32_t>::max() && ring_did[slot] != r.did) {
+                    throw L5Exception("writer ring collision: slot=" + std::to_string(slot) +
+                                      " has=" + std::to_string(ring_did[slot]) +
+                                      " new=" + std::to_string(r.did));
+                }
 
-                // docids JSON object (stream)
-                if (!first) dj.put(',');
-                first = false;
+                ring[slot] = std::move(r);
+                ring_did[slot] = ring[slot].did;
 
-                dj.put('{');
+                // commit in-order as far as possible
+                while (true) {
+                    const uint32_t s = expect % window;
+                    if (ring_did[s] != expect) break;
 
-                dj << "\"doc_id\":";
-                json_write_string(dj, cur.doc_id);
+                    DocResult& cur = ring[s];
 
-                dj << ",\"organization_id\":";
-                json_write_string(dj, cur.organization_id);
+                    // docmeta: write by fields (padding-safe)
+                    dm.write(reinterpret_cast<const char*>(&cur.meta.tok_len), sizeof(cur.meta.tok_len));
+                    dm.write(reinterpret_cast<const char*>(&cur.meta.simhash_hi), sizeof(cur.meta.simhash_hi));
+                    dm.write(reinterpret_cast<const char*>(&cur.meta.simhash_lo), sizeof(cur.meta.simhash_lo));
 
-                dj << ",\"external_id\":";
-                json_write_string(dj, cur.external_id.empty() ? cur.doc_id : cur.external_id);
+                    // docids JSON object (stream)
+                    if (!first) dj.put(',');
+                    first = false;
 
-                dj << ",\"source_path\":";
-                json_write_string(dj, cur.source_path);
+                    dj.put('{');
 
-                dj << ",\"source_name\":";
-                json_write_string(dj, cur.source_name);
+                    dj << "\"doc_id\":";
+                    json_write_string(dj, cur.doc_id);
 
-                dj << ",\"meta_path\":";
-                std::string mp = segment_name + "/";
-                json_write_string(dj, mp);
+                    dj << ",\"organization_id\":";
+                    json_write_string(dj, cur.organization_id);
 
-                dj << ",\"preview_text\":";
-                json_write_string(dj, cur.preview_text);
+                    dj << ",\"external_id\":";
+                    json_write_string(dj, cur.external_id.empty() ? cur.doc_id : cur.external_id);
 
-                dj.put('}');
+                    dj << ",\"source_path\":";
+                    json_write_string(dj, cur.source_path);
 
-                ++expect;
+                    dj << ",\"source_name\":";
+                    json_write_string(dj, cur.source_name);
+
+                    dj << ",\"meta_path\":";
+                    json_write_string(dj, meta_path_prefix);
+
+                    dj << ",\"preview_text\":";
+                    json_write_string(dj, cur.preview_text);
+
+                    dj.put('}');
+
+                    // clear strings but keep capacity for reuse
+                    cur.doc_id.clear();
+                    cur.organization_id.clear();
+                    cur.external_id.clear();
+                    cur.source_path.clear();
+                    cur.source_name.clear();
+                    cur.preview_text.clear();
+
+                    ring_did[s] = std::numeric_limits<uint32_t>::max();
+
+                    ++expect;
+                    did_gate.committed.store(expect, std::memory_order_release);
+                    did_gate.cv.notify_all();
+                }
             }
+
+            // close JSON array
+            dj.put(']');
+            dj.flush();
+            dm.flush();
+
+            if (!dj) throw L5Exception("docids write failed");
+            if (!dm) throw L5Exception("docmeta write failed");
+
+            docs_written.store(expect, std::memory_order_relaxed);
+
+            // final notify
+            did_gate.committed.store(expect, std::memory_order_release);
+            did_gate.cv.notify_all();
+        } catch (...) {
+            set_error(std::current_exception());
         }
-
-        // close JSON array
-        dj.put(']');
-        dj.flush();
-        dm.flush();
-
-        if (!dj) throw L5Exception("docids write failed");
-        if (!dm) throw L5Exception("docmeta write failed");
-
-        docs_written.store(expect, std::memory_order_relaxed);
     });
 
     // worker threads
@@ -709,155 +799,167 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
 
     for (unsigned t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t](){
-            simdjson::dom::parser parser;
+            try {
+                simdjson::dom::parser parser;
 
-            std::vector<TokenSpan> spans;
-            spans.reserve(512);
+                std::vector<TokenSpan> spans;
+                spans.reserve(512);
 
-            std::vector<uint64_t> token_hashes;
-            token_hashes.reserve(512);
+                std::vector<uint64_t> token_hashes;
+                token_hashes.reserve(512);
 
-            std::string norm;
-            norm.reserve(8 * 1024);
+                std::string norm;
+                norm.reserve(8 * 1024);
 
-            std::ofstream post_out(postings_files[t], std::ios::binary);
-            if (!post_out) throw L5Exception("cannot open postings tmp: " + postings_files[t].string());
+                std::ofstream post_out(postings_files[t], std::ios::binary);
+                if (!post_out) throw L5Exception("cannot open postings tmp: " + postings_files[t].string());
 
-            std::string line;
-            while (q_lines.pop(line)) {
-                if (stop.load(std::memory_order_relaxed)) {
-                    continue;
-                }
-                if (line.empty()) continue;
+                std::string line;
+                while (q_lines.pop(line)) {
+                    if (stop.load(std::memory_order_relaxed)) {
+                        continue;
+                    }
+                    if (line.empty()) continue;
 
-                simdjson::dom::element doc;
-                if (parser.parse(line).get(doc)) continue;
+                    simdjson::dom::element doc;
+                    if (parser.parse(line).get(doc)) continue;
 
-                std::string_view did_sv;
-                if (doc["doc_id"].get(did_sv) || did_sv.empty()) continue;
+                    std::string_view did_sv;
+                    if (doc["doc_id"].get(did_sv) || did_sv.empty()) continue;
 
-                std::string_view text_sv;
-                if (doc["text"].get(text_sv) || text_sv.empty()) continue;
+                    std::string_view text_sv;
+                    if (doc["text"].get(text_sv) || text_sv.empty()) continue;
 
-                const bool text_is_norm = get_text_is_normalized(doc, strict);
+                    const bool text_is_norm = get_text_is_normalized(doc, strict);
 
-                // apply text byte cap (degrade: truncate)
-                text_sv = clip_text_view(text_sv, opt.max_text_bytes_per_doc, text_is_norm);
+                    // apply text byte cap (degrade: truncate)
+                    text_sv = clip_text_view(text_sv, opt.max_text_bytes_per_doc, text_is_norm);
 
-                // optional fields
-                std::string_view ext_sv      = get_sv_or_empty(doc, "external_id");
-                std::string_view org_sv      = get_sv_or_empty(doc, "organization_id");
-                std::string_view src_path_sv = get_sv_or_empty(doc, "source_path");
-                std::string_view src_name_sv = get_sv_or_empty(doc, "source_name");
+                    // optional fields
+                    std::string_view ext_sv      = get_sv_or_empty(doc, "external_id");
+                    std::string_view org_sv      = get_sv_or_empty(doc, "organization_id");
+                    std::string_view src_path_sv = get_sv_or_empty(doc, "source_path");
+                    std::string_view src_name_sv = get_sv_or_empty(doc, "source_name");
 
-                // normalize
-                if (text_is_norm) {
-                    norm.assign(text_sv.data(), text_sv.size());
-                } else {
-                    normalize_for_shingles_simple_to(text_sv, norm);
-                }
-
-                spans.clear();
-                tokenize_spans(norm, spans);
-                if (spans.empty()) continue;
-
-                if (opt.max_tokens_per_doc > 0 && spans.size() > (size_t)opt.max_tokens_per_doc) {
-                    spans.resize((size_t)opt.max_tokens_per_doc);
-                }
-                if (spans.size() < (size_t)K_SHINGLE) continue;
-
-                const int n = (int)spans.size();
-                const int cnt = n - K_SHINGLE + 1;
-                if (cnt <= 0) continue;
-
-                uint32_t did = 0;
-                if (!acquire_did(next_did, opt.max_docs_in_segment, did)) {
-                    stop.store(true, std::memory_order_relaxed);
-                    continue;
-                }
-
-                // hashes + simhash
-                hash_tokens_bytes_spans(norm, spans, token_hashes);
-                auto [hi, lo] = simhash128_token_hashes(token_hashes);
-
-                DocResult r;
-                r.did = did;
-                r.meta.tok_len = (uint32_t)spans.size();
-                r.meta.simhash_hi = hi;
-                r.meta.simhash_lo = lo;
-
-                r.doc_id = std::string(did_sv);
-                r.external_id = ext_sv.empty() ? r.doc_id : std::string(ext_sv);
-                r.organization_id = org_sv.empty() ? std::string() : std::string(org_sv);
-                r.source_path = src_path_sv.empty() ? std::string() : std::string(src_path_sv);
-                r.source_name = src_name_sv.empty() ? std::string() : std::string(src_name_sv);
-
-                // preview_text (<=240 bytes, UTF-8 safe)
-                {
-                    constexpr size_t PREV = 240;
-                    if (norm.size() <= PREV) {
-                        r.preview_text = norm;
+                    // normalize
+                    if (text_is_norm) {
+                        norm.assign(text_sv.data(), text_sv.size());
                     } else {
-                        const size_t cut = utf8_safe_prefix_len(norm, PREV);
-                        r.preview_text.assign(norm.data(), cut);
+                        normalize_for_shingles_simple_to(text_sv, norm);
+                    }
+
+                    spans.clear();
+                    tokenize_spans(norm, spans);
+                    if (spans.empty()) continue;
+
+                    if (opt.max_tokens_per_doc > 0 && spans.size() > (size_t)opt.max_tokens_per_doc) {
+                        spans.resize((size_t)opt.max_tokens_per_doc);
+                    }
+                    if (spans.size() < (size_t)K_SHINGLE) continue;
+
+                    const int n = (int)spans.size();
+                    const int cnt = n - K_SHINGLE + 1;
+                    if (cnt <= 0) continue;
+
+                    uint32_t did = 0;
+                    if (!acquire_did_window(next_did, opt.max_docs_in_segment, did_gate, window, stop, did)) {
+                        stop.store(true, std::memory_order_relaxed);
+                        did_gate.cv.notify_all();
+                        continue;
+                    }
+
+                    // hashes + simhash
+                    hash_tokens_bytes_spans(norm, spans, token_hashes);
+                    auto [hi, lo] = simhash128_token_hashes(token_hashes);
+
+                    DocResult r;
+                    r.did = did;
+                    r.meta.tok_len = (uint32_t)spans.size();
+                    r.meta.simhash_hi = hi;
+                    r.meta.simhash_lo = lo;
+
+                    r.doc_id = std::string(did_sv);
+                    r.external_id = ext_sv.empty() ? r.doc_id : std::string(ext_sv);
+                    r.organization_id = org_sv.empty() ? std::string() : std::string(org_sv);
+                    r.source_path = src_path_sv.empty() ? std::string() : std::string(src_path_sv);
+                    r.source_name = src_name_sv.empty() ? std::string() : std::string(src_name_sv);
+
+                    // preview_text (<=240 bytes, UTF-8 safe)
+                    {
+                        constexpr size_t PREV = 240;
+                        if (norm.size() <= PREV) {
+                            r.preview_text = norm;
+                        } else {
+                            const size_t cut = utf8_safe_prefix_len(norm, PREV);
+                            r.preview_text.assign(norm.data(), cut);
+                        }
+                    }
+
+                    // postings (streaming, per-thread file)
+                    const int step = (opt.shingle_stride > 0 ? opt.shingle_stride : 1);
+                    uint32_t produced = 0;
+                    const uint32_t max_sh =
+                        (opt.max_shingles_per_doc > 0) ? opt.max_shingles_per_doc : (uint32_t)cnt;
+
+                    uint64_t local_posts = 0;
+
+                    for (int pos = 0; pos < cnt && produced < max_sh; pos += step) {
+                        const uint64_t h = hash_shingle_token_hashes(token_hashes, pos, K_SHINGLE);
+                        P9 p{h, did, (uint32_t)pos};
+                        post_out.write(reinterpret_cast<const char*>(&p), (std::streamsize)sizeof(P9));
+                        ++produced;
+                        ++local_posts;
+                    }
+
+                    postings_written[t].fetch_add(local_posts, std::memory_order_relaxed);
+
+                    // send docmeta/docinfo to writer
+                    if (!q_docs.push(std::move(r))) {
+                        stop.store(true, std::memory_order_relaxed);
+                        did_gate.cv.notify_all();
+                        break;
                     }
                 }
 
-                // postings (streaming, per-thread file)
-                const int step = (opt.shingle_stride > 0 ? opt.shingle_stride : 1);
-                uint32_t produced = 0;
-                const uint32_t max_sh =
-                    (opt.max_shingles_per_doc > 0) ? opt.max_shingles_per_doc : (uint32_t)cnt;
-
-                uint64_t local_posts = 0;
-
-                for (int pos = 0; pos < cnt && produced < max_sh; pos += step) {
-                    const uint64_t h = hash_shingle_token_hashes(token_hashes, pos, K_SHINGLE);
-                    P9 p{h, did, (uint32_t)pos};
-                    post_out.write(reinterpret_cast<const char*>(&p), (std::streamsize)sizeof(P9));
-                    ++produced;
-                    ++local_posts;
-                }
-
-                postings_written[t].fetch_add(local_posts, std::memory_order_relaxed);
-
-                // send docmeta/docinfo to writer
-                if (!q_docs.push(std::move(r))) {
-                    // if writer closed unexpectedly -> stop
-                    stop.store(true, std::memory_order_relaxed);
-                }
+                post_out.flush();
+                if (!post_out) throw L5Exception("postings write failed: " + postings_files[t].string());
+            } catch (...) {
+                set_error(std::current_exception());
             }
-
-            post_out.flush();
-            if (!post_out) throw L5Exception("postings write failed: " + postings_files[t].string());
         });
     }
 
     // reader thread (streaming JSONL)
     std::thread reader([&](){
-        std::ifstream in(corpus_jsonl, std::ios::binary);
-        if (!in) throw L5Exception("cannot open corpus: " + corpus_jsonl.string());
+        try {
+            std::ifstream in(corpus_jsonl, std::ios::binary);
+            if (!in) throw L5Exception("cannot open corpus: " + corpus_jsonl.string());
 
-        std::string line;
-        line.reserve(64 * 1024);
+            std::string line;
+            line.reserve(64 * 1024);
 
-        // rough safety cap for line size (corpus produced by our service)
-        const size_t max_line = (size_t)std::max<uint32_t>(opt.max_text_bytes_per_doc + 1024u * 1024u, 2u * 1024u * 1024u);
+            // rough safety cap for line size (corpus produced by our service)
+            const size_t max_line = (size_t)std::max<uint32_t>(opt.max_text_bytes_per_doc + 1024u * 1024u,
+                                                               2u * 1024u * 1024u);
 
-        while (std::getline(in, line)) {
-            if (stop.load(std::memory_order_relaxed)) break;
-            if (line.empty()) continue;
+            while (std::getline(in, line)) {
+                if (stop.load(std::memory_order_relaxed)) break;
+                if (line.empty()) continue;
 
-            if (line.size() > max_line) {
-                // деградация: пропускаем слишком длинную строку (не держим в очереди)
-                continue;
+                if (line.size() > max_line) {
+                    // деградация: пропускаем слишком длинную строку (не держим в очереди)
+                    line.clear();
+                    continue;
+                }
+
+                if (!q_lines.push(std::move(line))) break;
+                line.clear(); // moved-from ok
             }
 
-            if (!q_lines.push(std::move(line))) break;
-            line.clear();
+            q_lines.close();
+        } catch (...) {
+            set_error(std::current_exception());
         }
-
-        q_lines.close();
     });
 
     // join pipeline
@@ -866,6 +968,8 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
 
     q_docs.close();
     writer.join();
+
+    if (err_ptr) std::rethrow_exception(err_ptr);
 
     const uint32_t N_docs = docs_written.load(std::memory_order_relaxed);
     if (N_docs == 0) throw L5Exception("no valid docs");

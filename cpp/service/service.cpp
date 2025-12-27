@@ -73,7 +73,7 @@ static void copy_file_binary(const fs::path& src, const fs::path& dst) {
 }
 
 static std::string shell_quote(const std::string& s) {
-  // single-quote safe for bash: ' -> '\''
+  // single-quote safe for bash: ' -> '\'' 
   std::string out;
   out.reserve(s.size() + 8);
   out.push_back('\'');
@@ -176,7 +176,6 @@ static void unzip_libzip_safe(const fs::path& zip_path,
       fout.write(buf, (std::streamsize)rd);
       if (!fout) throw std::runtime_error("write failed: " + out.string());
     }
-    fout.flush();
   }
 }
 
@@ -204,11 +203,6 @@ fs::path L5Service::org_sqlite(const std::string& org) const { return org_root(o
 fs::path L5Service::org_tombstones(const std::string& org) const { return org_root(org) / "tombstones.jsonl"; }
 fs::path L5Service::org_uploads_dir(const std::string& org) const { return org_root(org) / "uploads"; }
 
-std::mutex& L5Service::org_mutex_(const std::string& org_id) {
-  const size_t h = std::hash<std::string>{}(org_id);
-  return org_mu_[h % ORG_LOCKS];
-}
-
 std::string L5Service::utc_now_iso() {
   using namespace std::chrono;
   auto now = system_clock::now();
@@ -225,7 +219,6 @@ std::string L5Service::utc_now_iso() {
 }
 
 std::string L5Service::gen_uuid_v4() {
-  // UUID-like string, good enough for IDs (not strict RFC4122)
   std::random_device rd;
   std::mt19937_64 gen(rd());
   std::uniform_int_distribution<uint64_t> dis;
@@ -252,9 +245,6 @@ UploadResult L5Service::ingest_file(const std::string& org_id,
                                     const std::string& bytes,
                                     const std::string& external_id_opt,
                                     bool text_is_normalized) {
-  // protect SQLite/file ops per org
-  std::lock_guard<std::mutex> lk(org_mutex_(org_id));
-
   ensure_dirs(org_root(org_id));
   ensure_dirs(org_uploads_dir(org_id));
   ensure_dirs(org_index_root(org_id));
@@ -298,16 +288,9 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
                                                     const std::string& zip_bytes,
                                                     bool text_is_normalized,
                                                     const std::string& segment_name_opt) {
-  // Phase 0: make sure org dirs & sqlite exist
-  {
-    std::lock_guard<std::mutex> lk(org_mutex_(org_id));
-    ensure_dirs(org_root(org_id));
-    ensure_dirs(org_uploads_dir(org_id));
-    ensure_dirs(org_index_root(org_id));
-
-    Storage st(org_sqlite(org_id).string());
-    st.init();
-  }
+  ensure_dirs(org_root(org_id));
+  ensure_dirs(org_uploads_dir(org_id));
+  ensure_dirs(org_index_root(org_id));
 
   Storage st(org_sqlite(org_id).string());
   st.init();
@@ -367,7 +350,7 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
       if (ec || rel.empty()) { ec.clear(); rel = d.source_name; }
       d.external_id = rel;
 
-      // store original into uploads (unique doc_id prefix => no collisions)
+      // store original into uploads
       d.stored_path = org_uploads_dir(org_id) / (d.doc_id + "_" + d.source_name);
       copy_file_binary(p, d.stored_path);
 
@@ -428,6 +411,7 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
   unsigned hw = std::thread::hardware_concurrency();
   if (hw == 0) hw = 4;
 
+  // I/O: обычно оптимум 8..16 потоков
   unsigned n_threads = std::min<unsigned>(hw, 16u);
   if (n_threads > pending.size()) n_threads = (unsigned)pending.size();
   if (n_threads == 0) n_threads = 1;
@@ -473,6 +457,7 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
 
           ExtractedText ex = extract_text_from_file(d.text_path, text_is_normalized);
 
+          // JSONL line (быстрее без построения json-объекта, но строки эскейпим через nlohmann::json)
           outp
             << "{\"doc_id\":" << json(d.doc_id).dump()
             << ",\"organization_id\":" << org_j
@@ -560,32 +545,26 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
     if (!corpus_out) throw std::runtime_error("failed writing corpus.jsonl");
   }
 
-  // bulk sqlite write (protected)
-  {
-    std::lock_guard<std::mutex> lk(org_mutex_(org_id));
-    st.upsert_docs_bulk(rows_all);
-  }
+  // bulk sqlite write
+  st.upsert_docs_bulk(rows_all);
 
-  // build index segment (serialize builds per process)
+  // build index segment
   l5::BuildOptions opt;
   opt.segment_name = segment_name_opt.empty()
       ? (std::string("seg_") + l5::utc_now_compact() + "_" + gen_uuid_v4().substr(0, 8))
       : segment_name_opt;
 
-  opt.max_threads = hw;
+  opt.max_threads = hw; // builder multi-thread
 
   const fs::path out_root = org_index_root(org_id);
+
+  // ВАЖНО: serialize build per-org shard (manifest / segment creation)
   {
-    std::lock_guard<std::mutex> lk(build_mu_);
+    std::lock_guard<std::mutex> lk(build_mu_for(org_id));
     out.build = l5::build_segment_jsonl(corpus, out_root, opt);
   }
 
-  // update last_segment (protected)
-  {
-    std::lock_guard<std::mutex> lk(org_mutex_(org_id));
-    st.update_last_segment(org_id, doc_ids_for_segment, out.build.segment_name);
-  }
-
+  st.update_last_segment(org_id, doc_ids_for_segment, out.build.segment_name);
   return out;
 }
 
@@ -597,7 +576,7 @@ l5::SearchResult L5Service::search(const std::string& org_id,
 
   Tombstones ts(org_tombstones(org_id));
   {
-    std::lock_guard<std::mutex> lk(tomb_mu_);
+    std::lock_guard<std::mutex> lk(tomb_mu_for(org_id));
     ts.load();
   }
 
@@ -614,20 +593,17 @@ l5::SearchResult L5Service::search(const std::string& org_id,
 }
 
 void L5Service::delete_doc(const std::string& org_id, const std::string& key) {
-  // SQLite read/update protected per org
-  std::lock_guard<std::mutex> lk(org_mutex_(org_id));
-
   Storage st(org_sqlite(org_id).string());
   st.init();
 
   auto row = st.get_by_doc_or_external(org_id, key);
   if (!row) return;
+  if (row->deleted) return;
 
-  // tombstones protected
   {
-    std::lock_guard<std::mutex> lk2(tomb_mu_);
+    std::lock_guard<std::mutex> lk(tomb_mu_for(org_id));
     Tombstones ts(org_tombstones(org_id));
-    ts.load();
+    // load() не нужен: append сам держит in-memory set_ актуальным для текущего объекта.
     ts.append(row->doc_id);
   }
 
@@ -635,7 +611,6 @@ void L5Service::delete_doc(const std::string& org_id, const std::string& key) {
 }
 
 std::vector<DocRow> L5Service::list_docs(const std::string& org_id, int limit, int offset) {
-  std::lock_guard<std::mutex> lk(org_mutex_(org_id));
   Storage st(org_sqlite(org_id).string());
   st.init();
   return st.list_docs(org_id, limit, offset);

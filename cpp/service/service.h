@@ -2,6 +2,7 @@
 
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -64,20 +65,24 @@ private:
   std::filesystem::path org_uploads_dir(const std::string& org) const;
 
   static std::string utc_now_iso();
-  static std::string gen_uuid_v4();
-
-  std::mutex& org_mutex_(const std::string& org_id);
+  static std::string gen_uuid_v4(); // единое имя, без *_like
 
 private:
   std::filesystem::path data_root_;
 
-  // Serialize only segment builds / manifest appends per process
-  std::mutex build_mu_;
+  // Сериализуем:
+  // - build (manifest append + сегментные файлы)
+  // - tombstones append/load
+  // Шардирование по org_id => меньше contention, чем один глобальный mutex.
+  static constexpr size_t kMutexShards = 64;
 
-  // Tombstones: load/append should not race
-  std::mutex tomb_mu_;
+  std::array<std::mutex, kMutexShards> build_mu_{};
+  std::array<std::mutex, kMutexShards> tomb_mu_{};
 
-  // Striped locks to protect SQLite (WAL still can lock on big bulk writes)
-  static constexpr size_t ORG_LOCKS = 64;
-  std::array<std::mutex, ORG_LOCKS> org_mu_{};
+  static size_t shard(const std::string& org) {
+    return std::hash<std::string>{}(org) % kMutexShards;
+  }
+
+  std::mutex& build_mu_for(const std::string& org) { return build_mu_[shard(org)]; }
+  std::mutex& tomb_mu_for (const std::string& org) { return tomb_mu_[shard(org)]; }
 };
