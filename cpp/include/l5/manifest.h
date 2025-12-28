@@ -1,4 +1,3 @@
-// Back_L5/cpp/include/l5/manifest.h
 #pragma once
 #include <cstdint>
 #include <filesystem>
@@ -25,6 +24,15 @@ struct Manifest {
 };
 
 Manifest load_manifest(const std::filesystem::path& out_root);
+
+// append (как было)
 bool append_segment_to_manifest(const std::filesystem::path& out_root, const SegmentEntry& e);
+
+// NEW: rewrite whole manifest atomically
+bool save_manifest(const std::filesystem::path& out_root, const Manifest& m);
+
+// NEW: remove a set of segments and rewrite manifest atomically
+bool remove_segments_from_manifest(const std::filesystem::path& out_root,
+                                   const std::vector<std::string>& segment_names);
 
 } // namespace l5

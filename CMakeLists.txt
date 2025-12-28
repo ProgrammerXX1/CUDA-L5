@@ -83,6 +83,10 @@ add_library(l5_engine
   cpp/src/result.cpp
   cpp/src/search_segment.cpp
   cpp/src/search_multi.cpp
+
+  # NEW: compaction + merge (LSM)
+  cpp/src/merge.cpp
+  cpp/src/compactor.cpp
 )
 
 target_include_directories(l5_engine

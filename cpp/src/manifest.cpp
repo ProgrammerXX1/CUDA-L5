@@ -1,8 +1,8 @@
-// Back_L5/cpp/src/manifest.cpp
 #include "l5/manifest.h"
 #include "l5/format.h"
 
 #include <fstream>
+#include <unordered_set>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -54,6 +54,30 @@ Manifest load_manifest(const std::filesystem::path& out_root) {
     return m;
 }
 
+bool save_manifest(const std::filesystem::path& out_root, const Manifest& m) {
+    const auto manifest_fin = out_root / "level5_manifest.json";
+    const auto manifest_tmp = out_root / "level5_manifest.json.tmp";
+
+    std::error_code ec;
+    std::filesystem::create_directories(out_root, ec);
+
+    json j;
+    j["segments"] = json::array();
+
+    for (const auto& e : m.segments) {
+        if (e.segment_name.empty() || e.path.empty()) continue;
+        json entry;
+        entry["segment_name"] = e.segment_name;
+        entry["path"] = e.path;
+        entry["built_at_utc"] = e.built_at_utc;
+        entry["stats"] = {{"docs", e.stats.docs}, {"k9", e.stats.k9}, {"k13", e.stats.k13}};
+        j["segments"].push_back(std::move(entry));
+    }
+
+    if (!write_text_file_tmp(manifest_tmp, j.dump())) return false;
+    return atomic_replace_file_best_effort(manifest_tmp, manifest_fin);
+}
+
 bool append_segment_to_manifest(const std::filesystem::path& out_root, const SegmentEntry& e) {
     const auto manifest_fin = out_root / "level5_manifest.json";
     const auto manifest_tmp = out_root / "level5_manifest.json.tmp";
@@ -70,8 +94,31 @@ bool append_segment_to_manifest(const std::filesystem::path& out_root, const Seg
     entry["stats"] = {{"docs", e.stats.docs}, {"k9", e.stats.k9}, {"k13", e.stats.k13}};
     j["segments"].push_back(std::move(entry));
 
+    std::error_code ec;
+    std::filesystem::create_directories(out_root, ec);
+
     if (!write_text_file_tmp(manifest_tmp, j.dump())) return false;
     return atomic_replace_file_best_effort(manifest_tmp, manifest_fin);
+}
+
+bool remove_segments_from_manifest(const std::filesystem::path& out_root,
+                                   const std::vector<std::string>& segment_names) {
+    if (segment_names.empty()) return true;
+
+    Manifest m = load_manifest(out_root);
+
+    std::unordered_set<std::string> del;
+    del.reserve(segment_names.size() * 2);
+    for (const auto& s : segment_names) del.insert(s);
+
+    Manifest out;
+    out.segments.reserve(m.segments.size());
+    for (auto& e : m.segments) {
+        if (del.find(e.segment_name) != del.end()) continue;
+        out.segments.push_back(std::move(e));
+    }
+
+    return save_manifest(out_root, out);
 }
 
 } // namespace l5

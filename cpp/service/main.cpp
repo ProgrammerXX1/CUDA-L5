@@ -1,23 +1,24 @@
 // src/main.cpp
-#include <iostream>
-#include <filesystem>
-#include <stdexcept>
-#include <fstream>
-#include <optional>
-#include <string>
-#include <cstdlib>
-#include <cctype>
-#include <ctime>
-#include <mutex>
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include "httplib.h"
 #include <nlohmann/json.hpp>
 
 #include "service.h"
-#include "l5/result.h"
 #include "l5/format.h"
+#include "l5/result.h"
 
 #include "storage.h"
 #include "extractor.h"
@@ -25,6 +26,8 @@
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+
+// -------------------- JSON helpers --------------------
 
 static json doc_to_json(const DocRow& d) {
   return {
@@ -53,6 +56,18 @@ static json upload_to_json(const UploadResult& r) {
   };
 }
 
+static json build_to_json(const l5::BuildStats& b) {
+  return {
+    {"segment_name", b.segment_name},
+    {"seg_dir", b.seg_dir.string()},
+    {"docs", b.docs},
+    {"post9", b.post9},
+    {"threads", b.threads},
+    {"strict_text_is_normalized", b.strict_text_is_normalized},
+    {"built_at_utc", b.built_at_utc},
+  };
+}
+
 static void reply_json(httplib::Response& res, int status, const json& j) {
   res.status = status;
   res.set_content(j.dump(), "application/json; charset=utf-8");
@@ -61,7 +76,126 @@ static void reply_json(httplib::Response& res, int status, const json& j) {
 // admin/wipe mutex
 static std::mutex g_admin_mu;
 
-// ---- helpers for debug index view ----
+// -------------------- string/param helpers --------------------
+
+static std::string to_lower_copy(std::string s) {
+  for (char& c : s) c = (char)std::tolower((unsigned char)c);
+  return s;
+}
+
+static std::string trim_copy(std::string s) {
+  auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
+  size_t a = 0;
+  while (a < s.size() && is_ws((unsigned char)s[a])) ++a;
+  size_t b = s.size();
+  while (b > a && is_ws((unsigned char)s[b - 1])) --b;
+  return s.substr(a, b - a);
+}
+
+// parse bool from query/form value
+static bool parse_bool_str(const std::string& v, bool defv) {
+  std::string s = trim_copy(v);
+  if (s.empty()) return defv;
+  s = to_lower_copy(s);
+  if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
+  if (s == "0" || s == "false" || s == "no" || s == "off") return false;
+  return defv;
+}
+
+static int parse_int_str(const std::string& v, int defv) {
+  try {
+    size_t pos = 0;
+    int x = std::stoi(trim_copy(v), &pos);
+    if (pos != trim_copy(v).size()) return defv;
+    return x;
+  } catch (...) {
+    return defv;
+  }
+}
+
+static unsigned parse_u32_str(const std::string& v, unsigned defv) {
+  try {
+    size_t pos = 0;
+    unsigned long x = std::stoul(trim_copy(v), &pos);
+    if (pos != trim_copy(v).size()) return defv;
+    if (x > 0xFFFFFFFFu) return defv;
+    return (unsigned)x;
+  } catch (...) {
+    return defv;
+  }
+}
+
+// try read param from multipart form or query params
+static std::optional<std::string> get_param_any(const httplib::Request& req, const char* key) {
+  if (req.has_param(key)) return req.get_param_value(key);
+  auto it = req.files.find(key);
+  if (it != req.files.end()) {
+    // for text fields in multipart, filename is usually empty
+    if (it->second.filename.empty()) return it->second.content;
+  }
+  return std::nullopt;
+}
+
+static unsigned env_u32(const char* k, unsigned defv) {
+  const char* s = std::getenv(k);
+  if (!s || !*s) return defv;
+  char* end = nullptr;
+  unsigned long v = std::strtoul(s, &end, 10);
+  if (!end || *end != '\0') return defv;
+  return (unsigned)v;
+}
+
+// -------------------- segment location (for debug) --------------------
+
+static fs::path shard_dir_name(unsigned shard) {
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "s%02u", shard);
+  return fs::path(buf);
+}
+
+static unsigned l5_shards_count_guess() {
+  unsigned n = env_u32("PLAGIO_L5_SHARDS", 32u);
+  if (n < 1) n = 1;
+  if (n > 256) n = 256;
+  return n;
+}
+
+static std::optional<fs::path> locate_segment_dir(const fs::path& index_root,
+                                                  const std::string& last_segment) {
+  if (last_segment.empty()) return std::nullopt;
+
+  std::error_code ec;
+
+  // If stored as relative path like "l1/seg_xxx" or "l5/s03/seg_xxx"
+  if (last_segment.find('/') != std::string::npos) {
+    fs::path p = index_root / fs::path(last_segment);
+    if (fs::exists(p, ec) && fs::is_directory(p, ec)) return p;
+  }
+
+  // Legacy: index/seg_xxx
+  {
+    fs::path p = index_root / last_segment;
+    if (fs::exists(p, ec) && fs::is_directory(p, ec)) return p;
+  }
+
+  // L1..L4
+  for (int lvl = 1; lvl <= 4; ++lvl) {
+    fs::path p = index_root / ("l" + std::to_string(lvl)) / last_segment;
+    if (fs::exists(p, ec) && fs::is_directory(p, ec)) return p;
+  }
+
+  // L5 shards
+  const unsigned nsh = l5_shards_count_guess();
+  for (unsigned sh = 0; sh < nsh; ++sh) {
+    fs::path p = index_root / "l5" / shard_dir_name(sh) / last_segment;
+    if (fs::exists(p, ec) && fs::is_directory(p, ec)) return p;
+  }
+
+  return std::nullopt;
+}
+
+// -------------------- debug helpers (docmeta/docids) --------------------
+
 static bool read_docmeta_by_did(const fs::path& bin_path,
                                 uint32_t did,
                                 l5::HeaderV2& hdr_out,
@@ -118,15 +252,7 @@ static std::optional<json> find_docinfo_entry_with_did(const fs::path& docids_js
   return std::nullopt;
 }
 
-// ---- helpers for text extraction endpoint ----
-static std::string to_lower_copy(std::string s) {
-  for (char& c : s) c = (char)std::tolower((unsigned char)c);
-  return s;
-}
-
-static std::string lower_ext(const fs::path& p) {
-  return to_lower_copy(p.extension().string());
-}
+// -------------------- debug text extraction helpers --------------------
 
 static void ensure_dirs(const fs::path& p) {
   std::error_code ec;
@@ -152,7 +278,7 @@ static int run_cmd_bash(const std::string& cmd) {
   return std::system(full.c_str());
 }
 
-static fs::path mk_tmp_dir() {
+static fs::path mk_tmp_dir_dbg() {
   const auto base = fs::temp_directory_path();
   const uint64_t t = (uint64_t)std::time(nullptr);
   for (int i = 0; i < 200; ++i) {
@@ -171,6 +297,10 @@ struct CleanupDir {
     fs::remove_all(p, ec);
   }
 };
+
+static std::string lower_ext(const fs::path& p) {
+  return to_lower_copy(p.extension().string());
+}
 
 // UTF-8 safe prefix boundary
 static size_t utf8_safe_prefix_len(std::string_view s, size_t max_bytes) {
@@ -204,7 +334,6 @@ static size_t utf8_safe_prefix_len(std::string_view s, size_t max_bytes) {
 }
 
 static fs::path convert_doc_to_txt_utf8(const fs::path& in_file, const fs::path& tmp_dir) {
-  // Convert doc/docx to txt via soffice using isolated profile
   const fs::path conv_src = tmp_dir / "conv_src";
   const fs::path conv_out = tmp_dir / "conv_out";
   const fs::path lo_profile = tmp_dir / "lo_profile";
@@ -238,7 +367,6 @@ static fs::path convert_doc_to_txt_utf8(const fs::path& in_file, const fs::path&
 
   const fs::path out_txt = conv_out / (unique_in.stem().string() + ".txt");
   if (!fs::exists(out_txt)) {
-    // sometimes soffice changes name; try find any .txt in outdir
     for (auto it = fs::directory_iterator(conv_out); it != fs::directory_iterator(); ++it) {
       if (it->is_regular_file() && lower_ext(it->path()) == ".txt") return it->path();
     }
@@ -247,35 +375,38 @@ static fs::path convert_doc_to_txt_utf8(const fs::path& in_file, const fs::path&
   return out_txt;
 }
 
-static std::string trim_copy(std::string s) {
-  auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
-  size_t a = 0;
-  while (a < s.size() && is_ws((unsigned char)s[a])) ++a;
-  size_t b = s.size();
-  while (b > a && is_ws((unsigned char)s[b - 1])) --b;
-  return s.substr(a, b - a);
-}
+// -------------------- JSON parsing helpers (search) --------------------
 
-// parse bool from query/form value
-static bool parse_bool_str(const std::string& v, bool defv) {
-  std::string s = trim_copy(v);
-  if (s.empty()) return defv;
-  s = to_lower_copy(s);
-  if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
-  if (s == "0" || s == "false" || s == "no" || s == "off") return false;
-  return defv;
-}
-
-// try read param from multipart form or query params
-static std::optional<std::string> get_param_any(const httplib::Request& req, const char* key) {
-  if (req.has_param(key)) return req.get_param_value(key);
-  auto it = req.files.find(key);
-  if (it != req.files.end()) {
-    // for text fields in multipart, filename is usually empty
-    if (it->second.filename.empty()) return it->second.content;
+static std::vector<int> parse_levels(const json& j) {
+  std::vector<int> out;
+  if (!j.contains("levels")) {
+    out = {1,2,3,4,5};
+    return out;
   }
-  return std::nullopt;
+  const auto& v = j["levels"];
+  if (!v.is_array()) return {1,2,3,4,5};
+  for (const auto& x : v) {
+    if (x.is_number_integer()) out.push_back(x.get<int>());
+  }
+  if (out.empty()) out = {1,2,3,4,5};
+  return out;
 }
+
+static std::vector<unsigned> parse_l5_shards(const json& j) {
+  std::vector<unsigned> out;
+  if (!j.contains("l5_shards")) return out; // empty => all
+  const auto& v = j["l5_shards"];
+  if (!v.is_array()) return out;
+  for (const auto& x : v) {
+    if (x.is_number_integer()) {
+      const int a = x.get<int>();
+      if (a >= 0) out.push_back((unsigned)a);
+    }
+  }
+  return out;
+}
+
+// -------------------- main --------------------
 
 int main(int argc, char** argv) {
   std::string data_root = (argc >= 2) ? argv[1] : "./DATA_ROOT";
@@ -283,22 +414,111 @@ int main(int argc, char** argv) {
 
   httplib::Server app;
 
-  // Simple safety limits (всё равно в памяти, но хотя бы режем DoS)
-  constexpr size_t MAX_ZIP_UPLOAD_BYTES = 512ull * 1024 * 1024; // 512MB
-  constexpr size_t MAX_JSON_BODY_BYTES  = 1ull * 1024 * 1024;   // 1MB
-  constexpr size_t MAX_QUERY_BYTES      = 256ull * 1024;        // 256KB
+  // Simple safety limits (multipart is still in-memory in httplib)
+  constexpr size_t MAX_ZIP_UPLOAD_BYTES  = 512ull * 1024 * 1024; // 512MB
+  constexpr size_t MAX_FILE_UPLOAD_BYTES = 256ull * 1024 * 1024; // 256MB
+  constexpr size_t MAX_JSON_BODY_BYTES   = 1ull * 1024 * 1024;   // 1MB
+  constexpr size_t MAX_QUERY_BYTES       = 256ull * 1024;        // 256KB
 
   // Debug endpoint hard cap
   constexpr size_t MAX_DEBUG_TEXT_BYTES_DEFAULT = 8ull * 1024 * 1024;   // 8 MiB
   constexpr size_t MAX_DEBUG_TEXT_BYTES_HARD    = 64ull * 1024 * 1024;  // 64 MiB
 
-  // Batch ZIP: one upload => one segment
-  // POST /v1/orgs/{org}/ingest_zip  multipart: file=@batch.zip,
-  //   normalize=1|0 (default 1): делать нормализацию В ЯДРЕ при индексации
-  //   (legacy) text_is_normalized=1|0: если 1 -> normalize=0
+  // --------------------
+  // Ingest ONE file -> default level=1
+  // POST /v1/orgs/{org}/ingest_file  multipart: file=@x, normalize=1|0, level=1..5, l5_shard=?, external_id=?, segment_name=?
+  // --------------------
+  app.Post(R"(/v1/orgs/([^/]+)/ingest_file)", [&](const httplib::Request& req, httplib::Response& res) {
+    try {
+      const std::string org_id = req.matches[1];
+
+      if (!req.is_multipart_form_data()) {
+        reply_json(res, 400, {{"error","expected multipart/form-data"}});
+        return;
+      }
+
+      auto file_it = req.files.find("file");
+      if (file_it == req.files.end()) {
+        reply_json(res, 400, {{"error","missing file field"}});
+        return;
+      }
+
+      const auto& f = file_it->second;
+      if (f.content.size() > MAX_FILE_UPLOAD_BYTES) {
+        reply_json(res, 413, {{"error","file too large"}, {"max_bytes", (uint64_t)MAX_FILE_UPLOAD_BYTES}});
+        return;
+      }
+
+      // defaults
+      int target_level = 1;
+      if (auto v = get_param_any(req, "level")) target_level = parse_int_str(*v, 1);
+      if (target_level < 1) target_level = 1;
+      if (target_level > 5) target_level = 5;
+
+      std::optional<unsigned> l5_shard;
+      if (auto v = get_param_any(req, "l5_shard")) {
+        l5_shard = parse_u32_str(*v, 0);
+      }
+
+      std::string external_id;
+      if (auto v = get_param_any(req, "external_id")) external_id = *v;
+
+      std::string segment_name;
+      if (auto v = get_param_any(req, "segment_name")) segment_name = *v;
+
+      // normalization mode
+      bool do_normalize = true;
+      bool have_norm = false;
+
+      if (auto v = get_param_any(req, "normalize")) {
+        do_normalize = parse_bool_str(*v, true);
+        have_norm = true;
+      }
+
+      if (!have_norm) {
+        if (auto v = get_param_any(req, "text_is_normalized")) {
+          const bool text_is_norm = parse_bool_str(*v, false);
+          do_normalize = !text_is_norm;
+        }
+      }
+
+      const bool text_is_normalized_flag = !do_normalize;
+
+      auto r = svc.ingest_file_build_segment(org_id,
+                                             f.filename,
+                                             f.content,
+                                             external_id,
+                                             /*text_is_normalized=*/text_is_normalized_flag,
+                                             target_level,
+                                             l5_shard,
+                                             segment_name);
+
+      json j = {
+        {"mode", "ingest_file"},
+        {"org_id", org_id},
+        {"level", target_level},
+        {"l5_shard", l5_shard.has_value() ? json(*l5_shard) : json(nullptr)},
+        {"normalize", do_normalize ? 1 : 0},
+        {"text_is_normalized", text_is_normalized_flag ? 1 : 0},
+        {"build", build_to_json(r.build)},
+        {"doc", upload_to_json(r.doc)}
+      };
+
+      reply_json(res, 200, j);
+    } catch (const std::invalid_argument& e) {
+      reply_json(res, 400, {{"error", e.what()}});
+    } catch (const std::exception& e) {
+      reply_json(res, 500, {{"error", e.what()}});
+    }
+  });
+
+  // --------------------
+  // Ingest ZIP -> default level=5 (L5 shard)
+  // POST /v1/orgs/{org}/ingest_zip  multipart: file=@batch.zip, normalize=1|0, level=1..5, l5_shard=?, segment_name=?
+  // --------------------
   app.Post(R"(/v1/orgs/([^/]+)/ingest_zip)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
-      std::string org_id = req.matches[1];
+      const std::string org_id = req.matches[1];
 
       if (!req.is_multipart_form_data()) {
         reply_json(res, 400, {{"error","expected multipart/form-data"}});
@@ -317,8 +537,22 @@ int main(int argc, char** argv) {
         return;
       }
 
-      // --- choose normalization at indexing stage ---
-      bool do_normalize = true;        // default = normalize
+      // defaults
+      int target_level = 5; // by design: zip is usually "big batch" => L5 (sharded)
+      if (auto v = get_param_any(req, "level")) target_level = parse_int_str(*v, 5);
+      if (target_level < 1) target_level = 1;
+      if (target_level > 5) target_level = 5;
+
+      std::optional<unsigned> l5_shard;
+      if (auto v = get_param_any(req, "l5_shard")) {
+        l5_shard = parse_u32_str(*v, 0);
+      }
+
+      std::string segment_name;
+      if (auto v = get_param_any(req, "segment_name")) segment_name = *v;
+
+      // normalization mode
+      bool do_normalize = true;
       bool have_norm = false;
 
       if (auto v = get_param_any(req, "normalize")) {
@@ -334,46 +568,41 @@ int main(int argc, char** argv) {
         }
       }
 
-      // Builder expects: text_is_normalized flag in corpus:
-      //   true  => skip normalization
-      //   false => do normalization
+      // Builder expects: text_is_normalized flag in corpus
       const bool text_is_normalized_flag = !do_normalize;
 
-      std::string segment_name;
-      if (req.has_param("segment_name")) segment_name = req.get_param_value("segment_name");
-
-      auto r = svc.ingest_zip_build_segment(org_id, f.filename, f.content,
-                                           /*text_is_normalized=*/text_is_normalized_flag,
-                                           segment_name);
+      auto r = svc.ingest_zip_build_segment(org_id,
+                                            f.filename,
+                                            f.content,
+                                            /*text_is_normalized=*/text_is_normalized_flag,
+                                            target_level,
+                                            l5_shard,
+                                            segment_name);
 
       json docs = json::array();
       for (const auto& d : r.docs) docs.push_back(upload_to_json(d));
 
-      json j = {
-        {"segment_name", r.build.segment_name},
-        {"seg_dir", r.build.seg_dir.string()},
-        {"docs", r.build.docs},
-        {"post9", r.build.post9},
-        {"threads", r.build.threads},
-        {"strict_text_is_normalized", r.build.strict_text_is_normalized},
-        {"built_at_utc", r.build.built_at_utc},
-        {"ingested_docs", docs},
-        {"skipped", json::array()},
-
-        // echo selected mode
+      json out = {
+        {"mode", "ingest_zip"},
+        {"org_id", org_id},
+        {"level", target_level},
+        {"l5_shard", l5_shard.has_value() ? json(*l5_shard) : json(nullptr)},
         {"normalize", do_normalize ? 1 : 0},
-        {"text_is_normalized", text_is_normalized_flag ? 1 : 0}
+        {"text_is_normalized", text_is_normalized_flag ? 1 : 0},
+        {"build", build_to_json(r.build)},
+        {"ingested_docs", docs},
+        {"skipped", json::array()}
       };
 
       for (const auto& s : r.skipped) {
-        j["skipped"].push_back({
+        out["skipped"].push_back({
           {"external_id", s.external_id},
           {"source_name", s.source_name},
           {"reason", s.reason},
         });
       }
 
-      reply_json(res, 200, j);
+      reply_json(res, 200, out);
     } catch (const std::invalid_argument& e) {
       reply_json(res, 400, {{"error", e.what()}});
     } catch (const std::exception& e) {
@@ -381,13 +610,20 @@ int main(int argc, char** argv) {
     }
   });
 
-  // Search: ядро НЕ нормализует запрос. Ищем "как ввели".
-  // Чтобы был матч, query должен быть в ТОЙ ЖЕ ФОРМЕ, что и индекс:
-  //   - индексировали normalize=1 => query должен быть нормализован тем же алгоритмом
-  //   - индексировали normalize=0 => query должен быть raw
+  // --------------------
+  // Search across selected levels/shards.
+  // POST /v1/orgs/{org}/search  JSON:
+  // {
+  //   "query": "...",
+  //   "query_is_normalized": false,   // default false => core normalizes query
+  //   "levels": [1,2,3,4,5],          // default all
+  //   "l5_shards": [0,1,2],           // optional; empty/absent => all shards
+  //   ... SearchOptions
+  // }
+  // --------------------
   app.Post(R"(/v1/orgs/([^/]+)/search)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
-      std::string org_id = req.matches[1];
+      const std::string org_id = req.matches[1];
 
       if (req.body.size() > MAX_JSON_BODY_BYTES) {
         reply_json(res, 413, {{"error","json body too large"}, {"max_bytes", (uint64_t)MAX_JSON_BODY_BYTES}});
@@ -398,18 +634,23 @@ int main(int argc, char** argv) {
       try {
         j = json::parse(req.body);
       } catch (...) {
-        reply_json(res, 400, {{"error","invalid json"}}); return;
+        reply_json(res, 400, {{"error","invalid json"}});
+        return;
       }
 
       std::string query = j.value("query", "");
-      if (query.empty()) { reply_json(res, 400, {{"error","query is empty"}}); return; }
+      if (query.empty()) {
+        reply_json(res, 400, {{"error","query is empty"}});
+        return;
+      }
       if (query.size() > MAX_QUERY_BYTES) {
         reply_json(res, 413, {{"error","query too large"}, {"max_bytes", (uint64_t)MAX_QUERY_BYTES}});
         return;
       }
 
-      // IMPORTANT: do NOT normalize query inside core
-      const bool query_is_normalized = true;
+      const bool query_is_normalized = j.value("query_is_normalized", false);
+      const std::vector<int> levels = parse_levels(j);
+      const std::vector<unsigned> l5_shards = parse_l5_shards(j);
 
       l5::SearchOptions opt;
       opt.topk = j.value("topk", opt.topk);
@@ -421,8 +662,15 @@ int main(int argc, char** argv) {
       opt.max_spans_per_doc = j.value("max_spans_per_doc", opt.max_spans_per_doc);
       opt.alpha = j.value("alpha", opt.alpha);
 
-      auto r = svc.search(org_id, query, query_is_normalized, opt);
-      reply_json(res, 200, l5::to_json(r));
+      auto r = svc.search_levels(org_id, query, query_is_normalized, levels, l5_shards, opt);
+
+      json out = l5::to_json(r);
+      out["org_id"] = org_id;
+      out["query_is_normalized"] = query_is_normalized;
+      out["levels"] = levels;
+      if (!l5_shards.empty()) out["l5_shards"] = l5_shards;
+
+      reply_json(res, 200, out);
     } catch (const std::invalid_argument& e) {
       reply_json(res, 400, {{"error", e.what()}});
     } catch (const std::exception& e) {
@@ -430,10 +678,69 @@ int main(int argc, char** argv) {
     }
   });
 
+  // --------------------
+  // Admin compaction: L1->L4
+  // POST /v1/orgs/{org}/admin/compact_small?fanout=20
+  // --------------------
+  app.Post(R"(/v1/orgs/([^/]+)/admin/compact_small)", [&](const httplib::Request& req, httplib::Response& res) {
+    try {
+      const std::string org_id = req.matches[1];
+
+      unsigned fanout = 20;
+      if (req.has_param("fanout")) fanout = parse_u32_str(req.get_param_value("fanout"), 20);
+      if (fanout < 2) fanout = 2;
+      if (fanout > 200) fanout = 200;
+
+      auto rep = svc.compact_small_levels(org_id, fanout);
+
+      reply_json(res, 200, {
+        {"ok", true},
+        {"org_id", org_id},
+        {"fanout", fanout},
+        {"rounds", rep.rounds},
+        {"merges", rep.merges},
+        {"new_segments", rep.new_segments},
+      });
+    } catch (const std::exception& e) {
+      reply_json(res, 500, {{"error", e.what()}});
+    }
+  });
+
+  // --------------------
+  // Admin compaction: L5 within shards
+  // POST /v1/orgs/{org}/admin/compact_l5?fanout=20
+  // --------------------
+  app.Post(R"(/v1/orgs/([^/]+)/admin/compact_l5)", [&](const httplib::Request& req, httplib::Response& res) {
+    try {
+      const std::string org_id = req.matches[1];
+
+      unsigned fanout = 20;
+      if (req.has_param("fanout")) fanout = parse_u32_str(req.get_param_value("fanout"), 20);
+      if (fanout < 2) fanout = 2;
+      if (fanout > 200) fanout = 200;
+
+      auto rep = svc.compact_l5_shards(org_id, fanout);
+
+      reply_json(res, 200, {
+        {"ok", true},
+        {"org_id", org_id},
+        {"fanout", fanout},
+        {"rounds", rep.rounds},
+        {"merges", rep.merges},
+        {"new_segments", rep.new_segments},
+      });
+    } catch (const std::exception& e) {
+      reply_json(res, 500, {{"error", e.what()}});
+    }
+  });
+
+  // --------------------
   // List documents
+  // GET /v1/orgs/{org}/documents?limit=50&offset=0
+  // --------------------
   app.Get(R"(/v1/orgs/([^/]+)/documents)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
-      std::string org_id = req.matches[1];
+      const std::string org_id = req.matches[1];
       int limit = 50, offset = 0;
 
       auto parse_i = [](const std::string& s) -> int {
@@ -461,11 +768,14 @@ int main(int argc, char** argv) {
     }
   });
 
+  // --------------------
   // Delete document (by doc_id or external_id)
+  // DELETE /v1/orgs/{org}/documents/{key}
+  // --------------------
   app.Delete(R"(/v1/orgs/([^/]+)/documents/([^/]+))", [&](const httplib::Request& req, httplib::Response& res) {
     try {
-      std::string org_id = req.matches[1];
-      std::string key = req.matches[2];
+      const std::string org_id = req.matches[1];
+      const std::string key = req.matches[2];
       svc.delete_doc(org_id, key);
       reply_json(res, 200, {{"ok", true}});
     } catch (const std::invalid_argument& e) {
@@ -475,11 +785,13 @@ int main(int argc, char** argv) {
     }
   });
 
-  // Debug: показать как документ лежит в сегменте (DocInfo + did + docmeta)
+  // --------------------
+  // Debug: show how a document lies in its segment (DocInfo + did + docmeta)
   // GET /v1/orgs/{org}/debug/index_view?key=<doc_id|external_id>&max_preview=4000
+  // --------------------
   app.Get(R"(/v1/orgs/([^/]+)/debug/index_view)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
-      std::string org_id = req.matches[1];
+      const std::string org_id = req.matches[1];
 
       if (!req.has_param("key")) {
         reply_json(res, 400, {{"error","missing key param (doc_id or external_id)"}});
@@ -513,9 +825,19 @@ int main(int argc, char** argv) {
         return;
       }
 
-      const fs::path seg_dir = index_root / row.last_segment;
-      const auto docids_path = seg_dir / "index_native_docids.json";
-      const auto bin_path    = seg_dir / "index_native.bin";
+      auto seg_dir_opt = locate_segment_dir(index_root, row.last_segment);
+      if (!seg_dir_opt) {
+        reply_json(res, 404, {
+          {"error","segment directory not found"},
+          {"last_segment", row.last_segment},
+          {"index_root", index_root.string()}
+        });
+        return;
+      }
+      const fs::path seg_dir = *seg_dir_opt;
+
+      const fs::path docids_path = seg_dir / "index_native_docids.json";
+      const fs::path bin_path    = seg_dir / "index_native.bin";
 
       uint32_t did = 0;
       std::string err;
@@ -543,7 +865,7 @@ int main(int argc, char** argv) {
         {"org_id", org_id},
         {"key", key},
         {"doc", doc_to_json(row)},
-        {"segment_name", row.last_segment},
+        {"last_segment", row.last_segment},
         {"seg_dir", seg_dir.string()},
         {"did", did},
         {"docinfo", docinfo},
@@ -569,14 +891,13 @@ int main(int argc, char** argv) {
     }
   });
 
-  // DEBUG: открыть выбранный файл и вернуть его текст.
-  // normalize=0 -> вернуть RAW (как в файле/после конвертации)
-  // normalize=1 -> вернуть NORMALIZED (как индексировали при normalize=1)
-  //
+  // --------------------
+  // DEBUG: open a stored file and return its text.
   // GET /v1/orgs/{org}/debug/normalized_text?name=<external_id_or_doc_id>&normalize=0|1&max_bytes=...
+  // --------------------
   app.Get(R"(/v1/orgs/([^/]+)/debug/normalized_text)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
-      std::string org_id = req.matches[1];
+      const std::string org_id = req.matches[1];
 
       if (!req.has_param("name")) {
         reply_json(res, 400, {{"error","missing name param (external_id or doc_id)"}});
@@ -623,7 +944,7 @@ int main(int argc, char** argv) {
       if (ext == ".txt") {
         ex = extract_text_from_file(src, /*assume_normalized=*/false);
       } else if (ext == ".doc" || ext == ".docx") {
-        fs::path tmp = mk_tmp_dir();
+        fs::path tmp = mk_tmp_dir_dbg();
         CleanupDir cleanup{tmp};
 
         fs::path txt_path = convert_doc_to_txt_utf8(src, tmp);
@@ -676,8 +997,10 @@ int main(int argc, char** argv) {
     }
   });
 
-  // ADMIN: wipe ALL базы загруженных файлов (orgs/*)
-  // POST /v1/admin/wipe_all  body: {"confirm":"WIPE_ALL"}  (или query ?confirm=WIPE_ALL)
+  // --------------------
+  // ADMIN: wipe ALL orgs
+  // POST /v1/admin/wipe_all  body: {"confirm":"WIPE_ALL"}  or ?confirm=WIPE_ALL
+  // --------------------
   app.Post(R"(/v1/admin/wipe_all)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
       std::string confirm;
@@ -733,11 +1056,13 @@ int main(int argc, char** argv) {
     }
   });
 
-  // ADMIN: wipe ONE org полностью
-  // POST /v1/orgs/{org}/admin/wipe  body: {"confirm":"WIPE_ORG"}  (или query ?confirm=WIPE_ORG)
+  // --------------------
+  // ADMIN: wipe ONE org
+  // POST /v1/orgs/{org}/admin/wipe  body: {"confirm":"WIPE_ORG"}  or ?confirm=WIPE_ORG
+  // --------------------
   app.Post(R"(/v1/orgs/([^/]+)/admin/wipe)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
-      std::string org_id = req.matches[1];
+      const std::string org_id = req.matches[1];
       std::string confirm;
 
       if (!req.body.empty()) {
