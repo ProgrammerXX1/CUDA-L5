@@ -1,8 +1,10 @@
-// src/storage.cpp
 #include "storage.h"
 #include <sqlite3.h>
-#include <stdexcept>
+
 #include <filesystem>
+#include <stdexcept>
+#include <string>
+#include <unordered_set>
 
 static void exec(sqlite3* db, const char* sql) {
   char* err = nullptr;
@@ -14,7 +16,6 @@ static void exec(sqlite3* db, const char* sql) {
 }
 
 Storage::Storage(const std::string& db_path) : path_(db_path) {
-  // ensure parent dirs exist (fix for GET /documents before ingest)
   std::error_code ec;
   std::filesystem::create_directories(std::filesystem::path(path_).parent_path(), ec);
 
@@ -36,83 +37,289 @@ void Storage::init() {
     PRAGMA synchronous=NORMAL;
 
     CREATE TABLE IF NOT EXISTS documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
       org_id TEXT NOT NULL,
-      doc_id TEXT NOT NULL,
-      external_id TEXT NOT NULL,
-      source_path TEXT,
-      source_name TEXT,
-      stored_path TEXT,
-      preview TEXT,
-      created_at_utc TEXT,
+      source_id TEXT NOT NULL,
+      file_name TEXT NOT NULL,
+      title TEXT,
+      author TEXT,
+      created_at TEXT,
+      stored_at_utc TEXT,
       deleted INTEGER DEFAULT 0,
       deleted_at_utc TEXT,
-      last_segment TEXT,
-      PRIMARY KEY(org_id, doc_id)
+      last_segment TEXT
     );
 
-    CREATE INDEX IF NOT EXISTS idx_docs_org_external ON documents(org_id, external_id);
-    CREATE INDEX IF NOT EXISTS idx_docs_org_deleted  ON documents(org_id, deleted);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_org_source ON documents(org_id, source_id);
+    CREATE INDEX IF NOT EXISTS idx_docs_org_deleted ON documents(org_id, deleted);
+    CREATE INDEX IF NOT EXISTS idx_docs_org_id ON documents(org_id, id);
   )SQL");
 }
 
-void Storage::upsert_doc(const DocRow& d) {
+static DocRow row_from_stmt(sqlite3_stmt* st) {
+  DocRow r;
+
+  r.id = sqlite3_column_int64(st, 0);
+
+  const unsigned char* c1 = sqlite3_column_text(st, 1);
+  r.org_id = c1 ? (const char*)c1 : "";
+
+  const unsigned char* c2 = sqlite3_column_text(st, 2);
+  r.source_id = c2 ? (const char*)c2 : "";
+
+  const unsigned char* c3 = sqlite3_column_text(st, 3);
+  r.file_name = c3 ? (const char*)c3 : "";
+
+  const unsigned char* c4 = sqlite3_column_text(st, 4);
+  r.title = c4 ? (const char*)c4 : "";
+
+  const unsigned char* c5 = sqlite3_column_text(st, 5);
+  r.author = c5 ? (const char*)c5 : "";
+
+  const unsigned char* c6 = sqlite3_column_text(st, 6);
+  r.created_at = c6 ? (const char*)c6 : "";
+
+  const unsigned char* c7 = sqlite3_column_text(st, 7);
+  r.stored_at_utc = c7 ? (const char*)c7 : "";
+
+  r.deleted = sqlite3_column_int(st, 8);
+
+  const unsigned char* c9 = sqlite3_column_text(st, 9);
+  r.deleted_at_utc = c9 ? (const char*)c9 : "";
+
+  const unsigned char* c10 = sqlite3_column_text(st, 10);
+  r.last_segment = c10 ? (const char*)c10 : "";
+
+  return r;
+}
+
+std::optional<DocRow> Storage::get_by_source_id(const std::string& org_id, const std::string& source_id) {
   auto* db = (sqlite3*)db_;
   const char* sql = R"SQL(
-    INSERT INTO documents(org_id, doc_id, external_id, source_path, source_name, stored_path, preview, created_at_utc, deleted, deleted_at_utc, last_segment)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(org_id, doc_id) DO UPDATE SET
-      external_id=excluded.external_id,
-      source_path=excluded.source_path,
-      source_name=excluded.source_name,
-      stored_path=excluded.stored_path,
-      preview=excluded.preview,
-      created_at_utc=excluded.created_at_utc,
-      deleted=excluded.deleted,
-      deleted_at_utc=excluded.deleted_at_utc,
-      last_segment=excluded.last_segment;
+    SELECT id, org_id, source_id, file_name, title, author, created_at, stored_at_utc,
+           deleted, deleted_at_utc, last_segment
+    FROM documents
+    WHERE org_id=? AND source_id=?
+    LIMIT 1;
   )SQL";
 
   sqlite3_stmt* st = nullptr;
   if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed");
+  sqlite3_bind_text(st, 1, org_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, source_id.c_str(), -1, SQLITE_TRANSIENT);
 
-  sqlite3_bind_text(st, 1, d.org_id.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 2, d.doc_id.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 3, d.external_id.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 4, d.source_path.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 5, d.source_name.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 6, d.stored_path.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 7, d.preview.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 8, d.created_at_utc.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_int(st, 9, d.deleted);
-  sqlite3_bind_text(st,10, d.deleted_at_utc.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st,11, d.last_segment.c_str(), -1, SQLITE_TRANSIENT);
+  int rc = sqlite3_step(st);
+  if (rc == SQLITE_ROW) {
+    DocRow r = row_from_stmt(st);
+    sqlite3_finalize(st);
+    return r;
+  }
+  sqlite3_finalize(st);
+  return std::nullopt;
+}
+
+std::optional<DocRow> Storage::get_by_internal_id(const std::string& org_id, int64_t id) {
+  auto* db = (sqlite3*)db_;
+  const char* sql = R"SQL(
+    SELECT id, org_id, source_id, file_name, title, author, created_at, stored_at_utc,
+           deleted, deleted_at_utc, last_segment
+    FROM documents
+    WHERE org_id=? AND id=?
+    LIMIT 1;
+  )SQL";
+
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed");
+  sqlite3_bind_text(st, 1, org_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 2, id);
+
+  int rc = sqlite3_step(st);
+  if (rc == SQLITE_ROW) {
+    DocRow r = row_from_stmt(st);
+    sqlite3_finalize(st);
+    return r;
+  }
+  sqlite3_finalize(st);
+  return std::nullopt;
+}
+
+int64_t Storage::upsert_doc_get_id(DocRow& d) {
+  auto* db = (sqlite3*)db_;
+  sqlite3_busy_timeout(db, 5000);
+
+  // First, try find existing row id
+  {
+    auto ex = get_by_source_id(d.org_id, d.source_id);
+    if (ex) {
+      d.id = ex->id;
+
+      const char* sql = R"SQL(
+        UPDATE documents
+        SET file_name=?,
+            title=?,
+            author=?,
+            created_at=?,
+            stored_at_utc=?,
+            deleted=?,
+            deleted_at_utc=?,
+            last_segment=?
+        WHERE id=?;
+      )SQL";
+
+      sqlite3_stmt* st = nullptr;
+      if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed");
+
+      sqlite3_bind_text(st, 1, d.file_name.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st, 2, d.title.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st, 3, d.author.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st, 4, d.created_at.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st, 5, d.stored_at_utc.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_int (st, 6, d.deleted);
+      sqlite3_bind_text(st, 7, d.deleted_at_utc.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st, 8, d.last_segment.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_int64(st, 9, d.id);
+
+      if (sqlite3_step(st) != SQLITE_DONE) {
+        sqlite3_finalize(st);
+        throw std::runtime_error("sqlite step failed (update)");
+      }
+      sqlite3_finalize(st);
+      return d.id;
+    }
+  }
+
+  // Insert new
+  {
+    const char* sql = R"SQL(
+      INSERT INTO documents(org_id, source_id, file_name, title, author, created_at, stored_at_utc, deleted, deleted_at_utc, last_segment)
+      VALUES(?,?,?,?,?,?,?,?,?,?);
+    )SQL";
+
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed");
+
+    sqlite3_bind_text(st, 1, d.org_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, d.source_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, d.file_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, d.title.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, d.author.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, d.created_at.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, d.stored_at_utc.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (st, 8, d.deleted);
+    sqlite3_bind_text(st, 9, d.deleted_at_utc.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st,10, d.last_segment.c_str(), -1, SQLITE_TRANSIENT);
+
+    if (sqlite3_step(st) != SQLITE_DONE) {
+      sqlite3_finalize(st);
+      throw std::runtime_error("sqlite step failed (insert)");
+    }
+    sqlite3_finalize(st);
+
+    d.id = sqlite3_last_insert_rowid(db);
+    return d.id;
+  }
+}
+
+std::vector<DocRow> Storage::get_by_internal_ids(const std::string& org_id, const std::vector<int64_t>& ids) {
+  std::vector<DocRow> out;
+  if (ids.empty()) return out;
+
+  // de-dup ids
+  std::vector<int64_t> uniq;
+  uniq.reserve(ids.size());
+  {
+    std::unordered_set<int64_t> seen;
+    seen.reserve(ids.size() * 2);
+    for (auto id : ids) {
+      if (id <= 0) continue;
+      if (seen.insert(id).second) uniq.push_back(id);
+    }
+  }
+  if (uniq.empty()) return out;
+
+  auto* db = (sqlite3*)db_;
+
+  std::string sql =
+    "SELECT id, org_id, source_id, file_name, title, author, created_at, stored_at_utc, deleted, deleted_at_utc, last_segment "
+    "FROM documents WHERE org_id=? AND id IN (";
+
+  for (size_t i = 0; i < uniq.size(); ++i) {
+    if (i) sql += ",";
+    sql += "?";
+  }
+  sql += ");";
+
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+    throw std::runtime_error("sqlite prepare failed (get_by_internal_ids)");
+  }
+
+  int bind_i = 1;
+  sqlite3_bind_text(st, bind_i++, org_id.c_str(), -1, SQLITE_TRANSIENT);
+  for (auto id : uniq) sqlite3_bind_int64(st, bind_i++, id);
+
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    out.push_back(row_from_stmt(st));
+  }
+  sqlite3_finalize(st);
+  return out;
+}
+
+std::vector<DocRow> Storage::list_docs(const std::string& org_id, int limit, int offset) {
+  auto* db = (sqlite3*)db_;
+  const char* sql = R"SQL(
+    SELECT id, org_id, source_id, file_name, title, author, created_at, stored_at_utc,
+           deleted, deleted_at_utc, last_segment
+    FROM documents
+    WHERE org_id=?
+    ORDER BY id DESC
+    LIMIT ? OFFSET ?;
+  )SQL";
+
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed");
+  sqlite3_bind_text(st, 1, org_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int(st, 2, limit);
+  sqlite3_bind_int(st, 3, offset);
+
+  std::vector<DocRow> out;
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    out.push_back(row_from_stmt(st));
+  }
+  sqlite3_finalize(st);
+  return out;
+}
+
+void Storage::mark_deleted_by_source_id(const std::string& org_id, const std::string& source_id, const std::string& deleted_at_utc) {
+  auto* db = (sqlite3*)db_;
+  const char* sql = R"SQL(
+    UPDATE documents
+    SET deleted=1, deleted_at_utc=?
+    WHERE org_id=? AND source_id=?;
+  )SQL";
+
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed");
+  sqlite3_bind_text(st, 1, deleted_at_utc.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, org_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 3, source_id.c_str(), -1, SQLITE_TRANSIENT);
 
   if (sqlite3_step(st) != SQLITE_DONE) {
     sqlite3_finalize(st);
-    throw std::runtime_error("sqlite step failed");
+    throw std::runtime_error("sqlite step failed (mark_deleted)");
   }
   sqlite3_finalize(st);
 }
 
-void Storage::upsert_docs_bulk(const std::vector<DocRow>& docs) {
-  if (docs.empty()) return;
-
+void Storage::update_last_segment_by_ids(const std::string& org_id,
+                                        const std::vector<int64_t>& ids,
+                                        const std::string& last_segment) {
+  if (ids.empty()) return;
   auto* db = (sqlite3*)db_;
   sqlite3_busy_timeout(db, 5000);
 
   const char* sql = R"SQL(
-    INSERT INTO documents(org_id, doc_id, external_id, source_path, source_name, stored_path, preview, created_at_utc, deleted, deleted_at_utc, last_segment)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(org_id, doc_id) DO UPDATE SET
-      external_id=excluded.external_id,
-      source_path=excluded.source_path,
-      source_name=excluded.source_name,
-      stored_path=excluded.stored_path,
-      preview=excluded.preview,
-      created_at_utc=excluded.created_at_utc,
-      deleted=excluded.deleted,
-      deleted_at_utc=excluded.deleted_at_utc,
-      last_segment=excluded.last_segment;
+    UPDATE documents SET last_segment=? WHERE org_id=? AND id=?;
   )SQL";
 
   sqlite3_stmt* st = nullptr;
@@ -120,27 +327,19 @@ void Storage::upsert_docs_bulk(const std::vector<DocRow>& docs) {
   exec(db, "BEGIN IMMEDIATE;");
   try {
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) {
-      throw std::runtime_error("sqlite prepare failed (bulk upsert)");
+      throw std::runtime_error("sqlite prepare failed (update_last_segment_by_ids)");
     }
 
-    for (const auto& d : docs) {
+    for (auto id : ids) {
       sqlite3_reset(st);
       sqlite3_clear_bindings(st);
 
-      sqlite3_bind_text(st, 1, d.org_id.c_str(), -1, SQLITE_TRANSIENT);
-      sqlite3_bind_text(st, 2, d.doc_id.c_str(), -1, SQLITE_TRANSIENT);
-      sqlite3_bind_text(st, 3, d.external_id.c_str(), -1, SQLITE_TRANSIENT);
-      sqlite3_bind_text(st, 4, d.source_path.c_str(), -1, SQLITE_TRANSIENT);
-      sqlite3_bind_text(st, 5, d.source_name.c_str(), -1, SQLITE_TRANSIENT);
-      sqlite3_bind_text(st, 6, d.stored_path.c_str(), -1, SQLITE_TRANSIENT);
-      sqlite3_bind_text(st, 7, d.preview.c_str(), -1, SQLITE_TRANSIENT);
-      sqlite3_bind_text(st, 8, d.created_at_utc.c_str(), -1, SQLITE_TRANSIENT);
-      sqlite3_bind_int (st, 9, d.deleted);
-      sqlite3_bind_text(st,10, d.deleted_at_utc.c_str(), -1, SQLITE_TRANSIENT);
-      sqlite3_bind_text(st,11, d.last_segment.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st, 1, last_segment.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st, 2, org_id.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_int64(st, 3, id);
 
       if (sqlite3_step(st) != SQLITE_DONE) {
-        throw std::runtime_error("sqlite step failed (bulk upsert)");
+        throw std::runtime_error("sqlite step failed (update_last_segment_by_ids)");
       }
     }
 
@@ -153,155 +352,4 @@ void Storage::upsert_docs_bulk(const std::vector<DocRow>& docs) {
     try { exec(db, "ROLLBACK;"); } catch (...) {}
     throw;
   }
-}
-
-std::optional<DocRow> Storage::get_by_doc_or_external(const std::string& org_id, const std::string& key) {
-  auto* db = (sqlite3*)db_;
-  const char* sql = R"SQL(
-    SELECT org_id, doc_id, external_id, source_path, source_name, stored_path, preview, created_at_utc, deleted, deleted_at_utc, last_segment
-    FROM documents
-    WHERE org_id=? AND (doc_id=? OR external_id=?)
-    LIMIT 1;
-  )SQL";
-
-  sqlite3_stmt* st = nullptr;
-  if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed");
-  sqlite3_bind_text(st, 1, org_id.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 2, key.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 3, key.c_str(), -1, SQLITE_TRANSIENT);
-
-  DocRow r;
-  int rc = sqlite3_step(st);
-  if (rc == SQLITE_ROW) {
-    r.org_id = (const char*)sqlite3_column_text(st, 0);
-    r.doc_id = (const char*)sqlite3_column_text(st, 1);
-    r.external_id = (const char*)sqlite3_column_text(st, 2);
-
-    const unsigned char* sp = sqlite3_column_text(st, 3);
-    r.source_path = sp ? (const char*)sp : "";
-
-    const unsigned char* sn = sqlite3_column_text(st, 4);
-    r.source_name = sn ? (const char*)sn : "";
-
-    const unsigned char* stp = sqlite3_column_text(st, 5);
-    r.stored_path = stp ? (const char*)stp : "";
-
-    const unsigned char* pr = sqlite3_column_text(st, 6);
-    r.preview = pr ? (const char*)pr : "";
-
-    const unsigned char* ca = sqlite3_column_text(st, 7);
-    r.created_at_utc = ca ? (const char*)ca : "";
-
-    r.deleted = sqlite3_column_int(st, 8);
-
-    const unsigned char* da = sqlite3_column_text(st, 9);
-    r.deleted_at_utc = da ? (const char*)da : "";
-
-    const unsigned char* ls = sqlite3_column_text(st, 10);
-    r.last_segment = ls ? (const char*)ls : "";
-
-    sqlite3_finalize(st);
-    return r;
-  }
-  sqlite3_finalize(st);
-  return std::nullopt;
-}
-
-std::vector<DocRow> Storage::list_docs(const std::string& org_id, int limit, int offset) {
-  auto* db = (sqlite3*)db_;
-  const char* sql = R"SQL(
-    SELECT org_id, doc_id, external_id, source_path, source_name, stored_path, preview, created_at_utc, deleted, deleted_at_utc, last_segment
-    FROM documents
-    WHERE org_id=?
-    ORDER BY created_at_utc DESC
-    LIMIT ? OFFSET ?;
-  )SQL";
-
-  sqlite3_stmt* st = nullptr;
-  if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed");
-  sqlite3_bind_text(st, 1, org_id.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_int(st, 2, limit);
-  sqlite3_bind_int(st, 3, offset);
-
-  std::vector<DocRow> out;
-  while (sqlite3_step(st) == SQLITE_ROW) {
-    DocRow r;
-    r.org_id = (const char*)sqlite3_column_text(st, 0);
-    r.doc_id = (const char*)sqlite3_column_text(st, 1);
-    r.external_id = (const char*)sqlite3_column_text(st, 2);
-
-    const unsigned char* sp = sqlite3_column_text(st, 3);
-    r.source_path = sp ? (const char*)sp : "";
-
-    const unsigned char* sn = sqlite3_column_text(st, 4);
-    r.source_name = sn ? (const char*)sn : "";
-
-    const unsigned char* stp = sqlite3_column_text(st, 5);
-    r.stored_path = stp ? (const char*)stp : "";
-
-    const unsigned char* pr = sqlite3_column_text(st, 6);
-    r.preview = pr ? (const char*)pr : "";
-
-    const unsigned char* ca = sqlite3_column_text(st, 7);
-    r.created_at_utc = ca ? (const char*)ca : "";
-
-    r.deleted = sqlite3_column_int(st, 8);
-
-    const unsigned char* da = sqlite3_column_text(st, 9);
-    r.deleted_at_utc = da ? (const char*)da : "";
-
-    const unsigned char* ls = sqlite3_column_text(st, 10);
-    r.last_segment = ls ? (const char*)ls : "";
-
-    out.push_back(std::move(r));
-  }
-  sqlite3_finalize(st);
-  return out;
-}
-
-void Storage::mark_deleted(const std::string& org_id, const std::string& key, const std::string& deleted_at_utc) {
-  auto* db = (sqlite3*)db_;
-  const char* sql = R"SQL(
-    UPDATE documents
-    SET deleted=1, deleted_at_utc=?
-    WHERE org_id=? AND (doc_id=? OR external_id=?);
-  )SQL";
-  sqlite3_stmt* st = nullptr;
-  if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed");
-  sqlite3_bind_text(st, 1, deleted_at_utc.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 2, org_id.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 3, key.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_text(st, 4, key.c_str(), -1, SQLITE_TRANSIENT);
-  if (sqlite3_step(st) != SQLITE_DONE) {
-    sqlite3_finalize(st);
-    throw std::runtime_error("sqlite step failed");
-  }
-  sqlite3_finalize(st);
-}
-
-void Storage::update_last_segment(const std::string& org_id, const std::vector<std::string>& doc_ids, const std::string& seg) {
-  if (doc_ids.empty()) return;
-  auto* db = (sqlite3*)db_;
-
-  const char* sql = R"SQL(
-    UPDATE documents SET last_segment=? WHERE org_id=? AND doc_id=?;
-  )SQL";
-
-  sqlite3_stmt* st = nullptr;
-  if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed");
-
-  for (const auto& did : doc_ids) {
-    sqlite3_reset(st);
-    sqlite3_clear_bindings(st);
-    sqlite3_bind_text(st, 1, seg.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, org_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 3, did.c_str(), -1, SQLITE_TRANSIENT);
-
-    if (sqlite3_step(st) != SQLITE_DONE) {
-      sqlite3_finalize(st);
-      throw std::runtime_error("sqlite step failed in update_last_segment");
-    }
-  }
-
-  sqlite3_finalize(st);
 }

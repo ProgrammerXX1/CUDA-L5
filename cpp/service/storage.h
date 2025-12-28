@@ -1,20 +1,23 @@
-// src/storage.h
 #pragma once
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
-#include <optional>
 
 struct DocRow {
-  std::string org_id;
-  std::string doc_id;
-  std::string external_id;
-  std::string source_path;    // stored file path
-  std::string source_name;    // original name
-  std::string stored_path;    // same as source_path for now
-  std::string preview;
-  std::string created_at_utc;
+  int64_t id{0};                // INTERNAL numeric id (our)
+  std::string org_id;           // organization_id as string
+  std::string source_id;        // backend document_id
+  std::string file_name;        // required
+  std::string title;            // optional
+  std::string author;           // optional
+  std::string created_at;        // optional (from backend)
+  std::string stored_at_utc;     // when inserted/updated in our DB
+
   int deleted{0};
   std::string deleted_at_utc;
+
+  // relative segment path for debug/ops, e.g. "l1/seg_xxx" or "l5/s00/seg_xxx"
   std::string last_segment;
 };
 
@@ -25,14 +28,21 @@ public:
 
   void init();
 
-  void upsert_doc(const DocRow& d);
-  void upsert_docs_bulk(const std::vector<DocRow>& docs); // NEW: fast bulk upsert
+  // Upsert by (org_id, source_id). Returns internal id.
+  int64_t upsert_doc_get_id(DocRow& d);
 
-  std::optional<DocRow> get_by_doc_or_external(const std::string& org_id, const std::string& key);
+  std::optional<DocRow> get_by_source_id(const std::string& org_id, const std::string& source_id);
+  std::optional<DocRow> get_by_internal_id(const std::string& org_id, int64_t id);
+
+  std::vector<DocRow> get_by_internal_ids(const std::string& org_id, const std::vector<int64_t>& ids);
+
   std::vector<DocRow> list_docs(const std::string& org_id, int limit, int offset);
 
-  void mark_deleted(const std::string& org_id, const std::string& key, const std::string& deleted_at_utc);
-  void update_last_segment(const std::string& org_id, const std::vector<std::string>& doc_ids, const std::string& seg);
+  void mark_deleted_by_source_id(const std::string& org_id, const std::string& source_id, const std::string& deleted_at_utc);
+
+  void update_last_segment_by_ids(const std::string& org_id,
+                                  const std::vector<int64_t>& ids,
+                                  const std::string& last_segment);
 
 private:
   void* db_{nullptr}; // sqlite3*

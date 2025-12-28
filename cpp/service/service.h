@@ -2,7 +2,6 @@
 
 #include <array>
 #include <filesystem>
-#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -10,33 +9,17 @@
 
 #include "l5/builder.h"
 #include "l5/search_multi.h"
+#include "l5/search_segment.h"
+#include "l5/compactor.h"
+
 #include "storage.h"
 #include "tombstone.h"
 
-struct UploadResult {
-  std::string org_id;
-  std::string doc_id;
-  std::string external_id;
-  std::string source_name;
-  std::string stored_path;
-  uint64_t bytes{0};
-};
-
-struct SkippedDoc {
-  std::string external_id;
-  std::string source_name;
-  std::string reason;
-};
-
-struct IngestZipResult {
+struct IndexTextResult {
   l5::BuildStats build;
-  std::vector<UploadResult> docs;
-  std::vector<SkippedDoc> skipped;
-};
-
-struct IngestOneResult {
-  l5::BuildStats build;
-  UploadResult doc;
+  DocRow doc;                  // includes internal id + last_segment
+  int indexed_level{1};         // 1 or 5 (heuristic)
+  std::optional<unsigned> l5_shard;
 };
 
 struct CompactReport {
@@ -49,24 +32,16 @@ class L5Service {
 public:
   explicit L5Service(std::filesystem::path data_root);
 
-  // Single file -> build one segment into target level (default L1)
-  IngestOneResult ingest_file_build_segment(const std::string& org_id,
-                                            const std::string& filename,
-                                            const std::string& bytes,
-                                            const std::string& external_id_opt,
-                                            bool text_is_normalized,
-                                            int target_level,
-                                            std::optional<unsigned> l5_shard_opt,
-                                            const std::string& segment_name_opt);
-
-  // ZIP batch -> build one segment into target level (default L5 shard)
-  IngestZipResult ingest_zip_build_segment(const std::string& org_id,
-                                           const std::string& zip_name,
-                                           const std::string& zip_bytes,
-                                           bool text_is_normalized,
-                                           int target_level,
-                                           std::optional<unsigned> l5_shard_opt,
-                                           const std::string& segment_name_opt);
+  // Index one document provided as TEXT.
+  // - source_id is backend document_id
+  // - internal id is sqlite AUTOINCREMENT and used as doc_id in segments
+  IndexTextResult index_text_document(const std::string& org_id,
+                                      const std::string& source_id,
+                                      const std::string& file_name,
+                                      const std::string& title,
+                                      const std::string& author,
+                                      const std::string& created_at,
+                                      const std::string& text);
 
   // Search in selected levels (1..4) and/or L5 (level=5). For L5 you can pass shard list; empty => all shards.
   l5::SearchResult search_levels(const std::string& org_id,
@@ -76,28 +51,29 @@ public:
                                  const std::vector<unsigned>& l5_shards,
                                  const l5::SearchOptions& opt);
 
-  void delete_doc(const std::string& org_id, const std::string& key);
-  std::vector<DocRow> list_docs(const std::string& org_id, int limit, int offset);
+  std::vector<DocRow> get_docs_by_internal_ids(const std::string& org_id, const std::vector<int64_t>& ids);
 
-  // Admin compaction:
   CompactReport compact_small_levels(const std::string& org_id, unsigned fanout);
   CompactReport compact_l5_shards(const std::string& org_id, unsigned fanout);
 
+  std::filesystem::path data_root() const { return data_root_; }
+
+  // public timestamp helper (main.cpp uses it)
+  static std::string utc_now_iso_utc();
+
 private:
   std::filesystem::path org_root(const std::string& org) const;
-  std::filesystem::path org_sqlite(const std::string& org) const;
-  std::filesystem::path org_tombstones(const std::string& org) const;
-  std::filesystem::path org_uploads_dir(const std::string& org) const;
-
   std::filesystem::path org_index_base(const std::string& org) const;
   std::filesystem::path org_level_root(const std::string& org, int level) const;
   std::filesystem::path org_l5_shard_root(const std::string& org, unsigned shard) const;
 
+  std::filesystem::path org_sqlite(const std::string& org) const;
+  std::filesystem::path org_tombstones(const std::string& org) const;
+
   unsigned l5_shards_count() const;
   unsigned pick_l5_shard(const std::string& seed) const;
 
-  static std::string utc_now_iso();
-  static std::string gen_uuid_v4();
+  static std::string mk_tmp_dir(const std::string& prefix);
 
 private:
   std::filesystem::path data_root_;
