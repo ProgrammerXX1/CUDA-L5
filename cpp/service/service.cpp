@@ -218,8 +218,7 @@ IndexTextResult L5Service::index_text_document(const std::string& org_id,
                                       env_u32("PLAGIO_BUILD_THREADS", 20u));
   opt.ram_limit_bytes = env_u64("PLAGIO_SORT_RAM_BYTES", (100ull << 30));
 
-  const uint64_t l5_min = env_u64("PLAGIO_L5_MIN_BYTES", 0); // 0 => always L1 for this contract
-  const bool go_l5 = (l5_min > 0 && (uint64_t)text_in.size() >= l5_min);
+  const bool go_l5 = false; // backend-text всегда L1 (подъём в L2..L4 делаем compact_small)
 
   int level = 1;
   std::optional<unsigned> shard;
@@ -245,7 +244,7 @@ IndexTextResult L5Service::index_text_document(const std::string& org_id,
     std::ofstream out(corpus, std::ios::binary);
     if (!out) throw std::runtime_error("cannot write corpus.jsonl");
 
-    const char* text_is_normalized_flag = "false";
+    const char* text_is_normalized_flag = "true";
 
     out
       << "{\"doc_id\":" << json(std::to_string(internal_id)).dump()

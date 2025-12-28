@@ -116,6 +116,7 @@ int main(int argc, char** argv) {
       std::optional<IndexTextResult> indexed;
       if (do_index) {
         indexed = svc.index_text_document(org_id, document_id, file_name, title, author, created_at, text);
+        (void)svc.compact_small_levels(org_id, 3);
       }
 
       if (!do_search) {
@@ -148,7 +149,39 @@ int main(int argc, char** argv) {
       opt.max_postings_per_hash = 2000000;
       opt.alpha = 0.60;
 
-      auto r = svc.search_levels(org_id, text, /*query_is_normalized=*/false, levels, l5_shards, opt);
+      // L1-L4: query уже нормализован backend'ом
+      auto r_small = svc.search_levels(org_id, text, /*query_is_normalized=*/true,
+                                 std::vector<int>{1,2,3,4}, std::vector<unsigned>{}, opt);
+
+      // L5: query нормализуем нашим алгоритмом (для L5 архива)
+      auto r_l5 = svc.search_levels(org_id, text, /*query_is_normalized=*/false,
+                              std::vector<int>{5}, std::vector<unsigned>{}, opt);
+
+      // merge best by doc_id
+      l5::SearchResult r;
+      r.query = text;
+      r.segments_scanned = r_small.segments_scanned + r_l5.segments_scanned;
+
+      std::unordered_map<std::string, l5::Hit> best;
+      best.reserve(r_small.hits.size() + r_l5.hits.size());
+
+      auto push_hits = [&](std::vector<l5::Hit>&& hits){
+        for (auto& h : hits) {
+          auto it = best.find(h.doc_id);
+          if (it == best.end() || h.C > it->second.C) best[h.doc_id] = std::move(h);
+        }
+      };
+
+      push_hits(std::move(r_small.hits));
+      push_hits(std::move(r_l5.hits));
+
+      r.hits.reserve(best.size());
+      for (auto& kv : best) r.hits.push_back(std::move(kv.second));
+
+      std::sort(r.hits.begin(), r.hits.end(), [](const l5::Hit& a, const l5::Hit& b){
+        return a.C > b.C;
+      });
+      if (r.hits.size() > opt.topk) r.hits.resize(opt.topk);
 
       // remove self-match by backend document_id
       std::vector<l5::Hit> hits;
