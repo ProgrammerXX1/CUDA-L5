@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
       std::optional<IndexTextResult> indexed;
       if (do_index) {
         indexed = svc.index_text_document(org_id, document_id, file_name, title, author, created_at, text);
-        (void)svc.compact_small_levels(org_id, 3);
+        (void)svc.compact_small_levels(org_id, 20);
       }
 
       if (!do_search) {

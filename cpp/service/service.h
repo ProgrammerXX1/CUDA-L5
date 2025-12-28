@@ -1,7 +1,9 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -28,13 +30,26 @@ struct CompactReport {
   std::vector<std::string> new_segments;
 };
 
+struct L5ZipIngestResult {
+  l5::BuildStats build;
+  uint64_t files_seen{0};
+  uint64_t files_skipped{0};
+  uint64_t docs_indexed{0};
+  unsigned shard{0};
+};
+
 class L5Service {
 public:
   explicit L5Service(std::filesystem::path data_root);
 
-  // Index one document provided as TEXT.
-  // - source_id is backend document_id
-  // - internal id is sqlite AUTOINCREMENT and used as doc_id in segments
+  // L5: ingest .txt/.doc/.docx files from ZIP into ONE segment (normalization enabled)
+  L5ZipIngestResult ingest_l5_zip_build_segment(const std::string& org_id,
+                                                const std::string& zip_name,
+                                                const std::string& zip_bytes,
+                                                std::optional<unsigned> l5_shard_opt,
+                                                const std::string& segment_name_opt);
+
+  // Index one document provided as TEXT (backend-normalized; no core normalization)
   IndexTextResult index_text_document(const std::string& org_id,
                                       const std::string& source_id,
                                       const std::string& file_name,
@@ -51,7 +66,8 @@ public:
                                  const std::vector<unsigned>& l5_shards,
                                  const l5::SearchOptions& opt);
 
-  std::vector<DocRow> get_docs_by_internal_ids(const std::string& org_id, const std::vector<int64_t>& ids);
+  std::vector<DocRow> get_docs_by_internal_ids(const std::string& org_id,
+                                               const std::vector<int64_t>& ids);
 
   CompactReport compact_small_levels(const std::string& org_id, unsigned fanout);
   CompactReport compact_l5_shards(const std::string& org_id, unsigned fanout);
