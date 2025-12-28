@@ -461,7 +461,7 @@ IngestOneResult L5Service::ingest_file_build_segment(const std::string& org_id,
   ExtractedText ex;
 
   if (ext == ".txt") {
-    ex = extract_text_from_file(stored, /*assume_normalized=*/false);
+    ex = extract_text_from_file(stored, /*assume_normalized=*/false, (size_t)opt.max_text_bytes_per_do);
   } else if (ext == ".doc" || ext == ".docx") {
     fs::path tmp = mk_tmp_dir("l5_one");
     CleanupDir cleanup{tmp};
@@ -485,7 +485,7 @@ IngestOneResult L5Service::ingest_file_build_segment(const std::string& org_id,
     if (out_txt.empty() || !fs::exists(out_txt)) {
       throw std::runtime_error("soffice produced no .txt for single file");
     }
-    ex = extract_text_from_file(out_txt, /*assume_normalized=*/false);
+    ex = extract_text_from_file(out_txt, /*assume_normalized=*/false, (size_t)opt.max_text_bytes_per_do);
   } else {
     throw std::invalid_argument("unsupported file type for ingest_file (only .txt/.doc/.docx)");
   }
@@ -754,8 +754,11 @@ IngestZipResult L5Service::ingest_zip_build_segment(const std::string& org_id,
             continue;
           }
 
-          ExtractedText ex = extract_text_from_file(d.text_path, text_is_normalized);
-
+          ExtractedText ex = extract_text_from_file(
+    d.text_path,
+    /*assume_normalized=*/text_is_normalized,
+    (size_t)opt.max_text_bytes_per_doc
+);
           // clip to builder cap (8MiB default) to avoid JSONL line cap drop in builder reader
           clip_text_inplace(ex.text, (size_t)opt.max_text_bytes_per_doc);
 

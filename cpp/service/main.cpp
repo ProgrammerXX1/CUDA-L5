@@ -942,13 +942,13 @@ int main(int argc, char** argv) {
 
       ExtractedText ex;
       if (ext == ".txt") {
-        ex = extract_text_from_file(src, /*assume_normalized=*/false);
+        ex = extract_text_from_file(src, /*assume_normalized=*/false, max_bytes);
       } else if (ext == ".doc" || ext == ".docx") {
         fs::path tmp = mk_tmp_dir_dbg();
         CleanupDir cleanup{tmp};
 
         fs::path txt_path = convert_doc_to_txt_utf8(src, tmp);
-        ex = extract_text_from_file(txt_path, /*assume_normalized=*/false);
+        ex = extract_text_from_file(txt_path, /*assume_normalized=*/false, max_bytes);
       } else {
         reply_json(res, 400, {{"error","unsupported file type"}, {"ext", ext}, {"path", src.string()}});
         return;
