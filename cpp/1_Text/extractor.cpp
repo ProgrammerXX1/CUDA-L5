@@ -233,27 +233,63 @@ ExtractedText extract_text_from_file(const fs::path& p, bool assume_normalized, 
     // try: maybe file is UTF-8 but we cut mid-sequence. Use safe prefix <= max_bytes and recheck.
     if (max_bytes > 0) {
       const size_t n = std::min(max_bytes, raw.size());
-      if (cut > 0) {
-        std::string_view pref(raw.data(), cut);
-        // Heuristic:
-        // - If raw failed UTF-8 validation, pref may still be ASCII-valid for CP1251 texts ("Hello " + Cyrillic bytes).
-        // - Treat as UTF-8 truncation fix only if cut is close to end of the intended prefix.
-        const bool near_end = (n >= cut) && ((n - cut) <= 4);
-        if (near_end && utf8_is_valid(pref)) {
-          text.assign(pref.data(), pref.size());
-        } else {
-          // fallback CP1251 on prefix bytes (<= n)
-          std::string_view pref_bytes(raw.data(), n);
-          text = cp1251_to_utf8(pref_bytes);
-        }
+      std::string_view bytes(raw.data(), n);
+
+      // If the first n bytes are valid UTF-8, keep them as-is.
+      if (utf8_is_valid(bytes)) {
+        text.assign(bytes.data(), bytes.size());
       } else {
-        std::string_view pref_bytes(raw.data(), n);
-        text = cp1251_to_utf8(pref_bytes);
+        // Find a UTF-8-safe boundary inside the first n bytes.
+        const size_t cut = utf8_safe_prefix_len(bytes, n);
+
+        bool trunc_fix = false;
+        if (cut > 0 && cut < n && (n - cut) <= 4) {
+          const unsigned char lead = (unsigned char)raw[cut];
+          size_t len = 0;
+          if (lead >= 0xC2 && lead <= 0xDF) len = 2;
+          else if (lead >= 0xE0 && lead <= 0xEF) len = 3;
+          else if (lead >= 0xF0 && lead <= 0xF4) len = 4;
+
+          // We consider it a "truncated UTF-8 tail" only if:
+          // - lead looks like a UTF-8 starter,
+          // - the sequence would not fit into the first n bytes,
+          // - bytes that are present after lead (within n) are all continuation bytes,
+          // - and prefix before cut is valid UTF-8.
+          if (len != 0 && cut + len > n) {
+            bool cont_ok = true;
+            for (size_t j = cut + 1; j < n; ++j) {
+              const unsigned char cc = (unsigned char)raw[j];
+              if ((cc & 0xC0) != 0x80) { cont_ok = false; break; }
+            }
+            if (cont_ok) {
+              const std::string_view prefix(raw.data(), cut);
+              if (utf8_is_valid(prefix)) {
+                // If we have enough bytes (we read max_bytes+16), validate the full sequence.
+                // If we don't (EOF truncation), still keep the valid prefix.
+                if (cut + len <= raw.size()) {
+                  const std::string_view seq(raw.data() + cut, len);
+                  if (utf8_is_valid(seq)) {
+                    trunc_fix = true;
+                    text.assign(prefix.data(), prefix.size());
+                  }
+                } else {
+                  trunc_fix = true;
+                  text.assign(prefix.data(), prefix.size());
+                }
+              }
+            }
+          }
+        }
+
+        if (!trunc_fix) {
+          // Fallback: treat the first n bytes as CP1251.
+          text = cp1251_to_utf8(bytes);
+        }
       }
+
     } else {
       text = cp1251_to_utf8(raw);
     }
-
     // enforce hard cap on output too (UTF-8 safe)
     if (max_bytes > 0 && text.size() > max_bytes) {
       const size_t cut = utf8_safe_prefix_len(text, max_bytes);
