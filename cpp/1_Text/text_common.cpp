@@ -2,7 +2,10 @@
 #include "text_common.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
+#include <limits>
+#include <stdexcept>
 #include <string_view>
 
 namespace {
@@ -282,19 +285,40 @@ void tokenize_spans(const std::string& s, std::vector<TokenSpan>& out) {
     const size_t n = s.size();
     size_t i = 0;
 
-    auto is_ws = [](unsigned char c) -> bool {
-        return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+    auto is_ws_at = [&](size_t idx, size_t& step) -> bool {
+        const unsigned char c = (unsigned char)s[idx];
+        // ASCII whitespace
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') {
+            step = 1;
+            return true;
+        }
+        // UTF-8 NBSP: U+00A0 => 0xC2 0xA0
+        if (c == 0xC2 && idx + 1 < n && (unsigned char)s[idx + 1] == 0xA0) {
+            step = 2;
+            return true;
+        }
+        step = 1;
+        return false;
     };
 
     while (i < n) {
-        while (i < n && is_ws((unsigned char)s[i])) ++i;
+        size_t step = 1;
+        while (i < n && is_ws_at(i, step)) i += step;
         if (i >= n) break;
 
         const size_t start = i;
-        while (i < n && !is_ws((unsigned char)s[i])) ++i;
+        while (i < n) {
+            size_t st2 = 1;
+            if (is_ws_at(i, st2)) break;
+            ++i;
+        }
         const size_t len = i - start;
 
         if (len > 0) {
+            const uint32_t u32max = std::numeric_limits<uint32_t>::max();
+            if (start > (size_t)u32max || len > (size_t)u32max) {
+                throw std::runtime_error("token span overflow (string too large)");
+            }
             TokenSpan ts;
             ts.start = (uint32_t)start;
             ts.len = (uint32_t)len;
@@ -323,6 +347,10 @@ uint64_t hash_shingle_tokens_spans(const std::string& s,
                                   const std::vector<TokenSpan>& spans,
                                   int pos,
                                   int K) {
+    assert(pos >= 0);
+    assert(K > 0);
+    assert((size_t)pos <= spans.size());
+    assert((size_t)(pos + K) <= spans.size());
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     const int end = pos + K;
     for (int i = pos; i < end; ++i) {
@@ -365,6 +393,10 @@ void hash_tokens_bytes_spans(const std::string& s,
 uint64_t hash_shingle_token_hashes(const std::vector<uint64_t>& token_hashes,
                                    int pos,
                                    int K) {
+    assert(pos >= 0);
+    assert(K > 0);
+    assert((size_t)pos <= token_hashes.size());
+    assert((size_t)(pos + K) <= token_hashes.size());
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     const int end = pos + K;
     for (int i = pos; i < end; ++i) {

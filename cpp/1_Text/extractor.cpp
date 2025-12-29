@@ -1,6 +1,7 @@
 #include "extractor.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <cstdint>
 #include <fstream>
@@ -159,7 +160,26 @@ static std::string read_file_prefix(const fs::path& p, size_t max_bytes) {
         "Pass max_bytes>0 to read a safe prefix."
       );
     }
-    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    // Even if file_size is unavailable, enforce hard cap during read.
+    std::string out;
+    if (!ec && fsz <= (uintmax_t)kHardMaxReadBytes) {
+      out.reserve((size_t)fsz);
+    }
+    const size_t chunk = 1u << 20; // 1 MiB
+    std::vector<char> buf(chunk);
+    while (in) {
+      in.read(buf.data(), (std::streamsize)buf.size());
+      const std::streamsize got = in.gcount();
+      if (got <= 0) break;
+      if (out.size() + (size_t)got > kHardMaxReadBytes) {
+        throw std::runtime_error(
+          "file too large for full read: " + p.string() +
+          " (exceeds hard limit " + std::to_string((unsigned long long)kHardMaxReadBytes) + " bytes)"
+        );
+      }
+      out.append(buf.data(), (size_t)got);
+    }
+    return out;
   }
   
   if (max_bytes > kHardMaxReadBytes) {
@@ -205,25 +225,29 @@ ExtractedText extract_text_from_file(const fs::path& p, bool assume_normalized, 
 
   if (utf8_is_valid(raw)) {
     if (max_bytes > 0 && raw.size() > max_bytes) {
-      const size_t cut = utf8_safe_prefix_len(raw, max_bytes);
+      const size_t cut = utf8_safe_prefix_len(raw, max_bytes);// cut <= n
       raw.resize(cut);
     }
     text = std::move(raw);
   } else {
     // try: maybe file is UTF-8 but we cut mid-sequence. Use safe prefix <= max_bytes and recheck.
     if (max_bytes > 0) {
-      const size_t cut = utf8_safe_prefix_len(raw, max_bytes);
+      const size_t n = std::min(max_bytes, raw.size());
       if (cut > 0) {
         std::string_view pref(raw.data(), cut);
-        if (utf8_is_valid(pref)) {
+        // Heuristic:
+        // - If raw failed UTF-8 validation, pref may still be ASCII-valid for CP1251 texts ("Hello " + Cyrillic bytes).
+        // - Treat as UTF-8 truncation fix only if cut is close to end of the intended prefix.
+        const bool near_end = (n >= cut) && ((n - cut) <= 4);
+        if (near_end && utf8_is_valid(pref)) {
           text.assign(pref.data(), pref.size());
         } else {
-          // fallback CP1251 on prefix bytes
-          std::string_view pref_bytes(raw.data(), std::min(raw.size(), max_bytes));
+          // fallback CP1251 on prefix bytes (<= n)
+          std::string_view pref_bytes(raw.data(), n);
           text = cp1251_to_utf8(pref_bytes);
         }
       } else {
-        std::string_view pref_bytes(raw.data(), std::min(raw.size(), max_bytes));
+        std::string_view pref_bytes(raw.data(), n);
         text = cp1251_to_utf8(pref_bytes);
       }
     } else {
