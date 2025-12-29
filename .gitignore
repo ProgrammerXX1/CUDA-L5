@@ -1,32 +1,24 @@
-cat >> .gitignore <<'EOF'
+# runtime/data roots (индексы, загрузки, сегменты)
+DATA_ROOT*/
+DATA_ROOT
+
+# uploads (docx/pdf/etc)
+**/uploads/**
+*.docx
+*.pdf
+
 # build artifacts
 build/
-build_*/
 cmake-build-*/
 out/
-dist/
-
-# C/C++ outputs
+bin/
 *.o
 *.a
 *.so
-*.dylib
 *.dll
 *.exe
-
-# sanitizers / coverage
-asan.*
-ubsan.*
-*.profraw
-*.profdata
-
-# runtime/index artifacts (L5)
-DATA_ROOT_TEST/
-runtime/
 *.bin
 *.idx
-*.dat
-*.pack
-EOF
-
-git add .gitignore
+*.tmp
+*.log
+runtime/

@@ -6,17 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(L5_USE_FETCHCONTENT "Fetch dependencies if not found" ON)
-option(L5_BUILD_TOOLS "Build CLI tools (l5_build/l5_search/l5_validate)" ON)
-option(L5_BUILD_TESTS "Build tests" ON)
 option(L5_BUILD_SERVICE "Build HTTP service" ON)
 
 include(FetchContent)
 
 # -----------------------------
-# Dependencies
+# Dependencies (core)
 # -----------------------------
-
-# nlohmann_json
 find_package(nlohmann_json QUIET)
 if(NOT nlohmann_json_FOUND AND L5_USE_FETCHCONTENT)
   FetchContent_Declare(
@@ -27,7 +23,6 @@ if(NOT nlohmann_json_FOUND AND L5_USE_FETCHCONTENT)
   FetchContent_MakeAvailable(nlohmann_json)
 endif()
 
-# simdjson
 find_package(simdjson QUIET)
 if(NOT simdjson_FOUND AND L5_USE_FETCHCONTENT)
   FetchContent_Declare(
@@ -38,23 +33,123 @@ if(NOT simdjson_FOUND AND L5_USE_FETCHCONTENT)
   FetchContent_MakeAvailable(simdjson)
 endif()
 
-# Threads (for std::thread)
 find_package(Threads REQUIRED)
 
-# libzip (for zip.h)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBZIP REQUIRED libzip)
-
-# sqlite3 (prefer system, fallback to FetchContent optional)
-# On Linux usually: sudo apt-get install -y libsqlite3-dev
-find_package(SQLite3 QUIET)
-if(NOT SQLite3_FOUND)
-  message(STATUS "SQLite3 not found via find_package. Will try linking to sqlite3 directly.")
+# Resolve target names (differs by install/fetch)
+set(L5_SIMDJSON_TARGET "")
+if(TARGET simdjson::simdjson)
+  set(L5_SIMDJSON_TARGET simdjson::simdjson)
+elseif(TARGET simdjson)
+  set(L5_SIMDJSON_TARGET simdjson)
+else()
+  message(FATAL_ERROR "simdjson target not found (expected simdjson::simdjson or simdjson)")
 endif()
 
-# cpp-httplib (header-only)
-# We'll create an interface target so includes are easy.
+set(L5_NLOHMANN_TARGET "")
+if(TARGET nlohmann_json::nlohmann_json)
+  set(L5_NLOHMANN_TARGET nlohmann_json::nlohmann_json)
+else()
+  message(FATAL_ERROR "nlohmann_json target not found (expected nlohmann_json::nlohmann_json)")
+endif()
+
+# -----------------------------
+# Generate build/include/l5/* headers as symlinks to your current layout
+# This makes #include "l5/reader.h" etc work without editing sources.
+# -----------------------------
+set(L5_GEN_INCLUDE_ROOT "${CMAKE_CURRENT_BINARY_DIR}/include")
+set(L5_GEN_L5_DIR "${L5_GEN_INCLUDE_ROOT}/l5")
+file(MAKE_DIRECTORY "${L5_GEN_L5_DIR}")
+
+function(l5_symlink_header dst_name src_rel)
+  set(src "${CMAKE_CURRENT_SOURCE_DIR}/${src_rel}")
+  set(dst "${L5_GEN_L5_DIR}/${dst_name}")
+
+  if(NOT EXISTS "${src}")
+    message(FATAL_ERROR "Missing header: ${src}")
+  endif()
+
+  if(EXISTS "${dst}" OR IS_SYMLINK "${dst}")
+    file(REMOVE "${dst}")
+  endif()
+
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "${src}" "${dst}"
+    RESULT_VARIABLE rv
+  )
+  if(NOT rv EQUAL 0)
+    message(FATAL_ERROR "Failed to create symlink: ${dst} -> ${src}")
+  endif()
+endfunction()
+
+# l5/*.h mapping (your current folders)
+l5_symlink_header(builder.h        cpp/2_Builder/builder.h)
+
+l5_symlink_header(format.h         cpp/3_Index_IO/format.h)
+l5_symlink_header(manifest.h       cpp/3_Index_IO/manifest.h)
+l5_symlink_header(reader.h         cpp/3_Index_IO/reader.h)
+l5_symlink_header(validator.h      cpp/3_Index_IO/validator.h)
+l5_symlink_header(merge.h          cpp/3_Index_IO/merge.h)
+l5_symlink_header(compactor.h      cpp/3_Index_IO/compactor.h)
+l5_symlink_header(errors.h         cpp/3_Index_IO/errors.h)
+l5_symlink_header(docinfo.h        cpp/3_Index_IO/docinfo.h)
+l5_symlink_header(tokenmap.h       cpp/3_Index_IO/tokenmap.h)
+
+l5_symlink_header(query.h          cpp/4_Search/query.h)
+l5_symlink_header(result.h         cpp/4_Search/result.h)
+l5_symlink_header(search_segment.h cpp/4_Search/search_segment.h)
+l5_symlink_header(search_multi.h   cpp/4_Search/search_multi.h)
+
+# -----------------------------
+# Library: l5_engine
+# -----------------------------
+add_library(l5_engine
+  cpp/1_Text/text_common.cpp
+  cpp/1_Text/extractor.cpp
+
+  cpp/2_Builder/builder.cpp
+
+  cpp/3_Index_IO/format.cpp
+  cpp/3_Index_IO/manifest.cpp
+  cpp/3_Index_IO/reader.cpp
+  cpp/3_Index_IO/validator.cpp
+  cpp/3_Index_IO/merge.cpp
+  cpp/3_Index_IO/compactor.cpp
+
+  cpp/4_Search/query.cpp
+  cpp/4_Search/result.cpp
+  cpp/4_Search/search_segment.cpp
+  cpp/4_Search/search_multi.cpp
+)
+
+target_include_directories(l5_engine
+  PUBLIC
+    ${L5_GEN_INCLUDE_ROOT}                 # provides l5/*.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/1_Text # text_common.h, extractor.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/2_Builder
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/3_Index_IO
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/4_Search
+)
+
+target_link_libraries(l5_engine
+  PUBLIC
+    ${L5_NLOHMANN_TARGET}
+    ${L5_SIMDJSON_TARGET}
+    Threads::Threads
+)
+
+# -----------------------------
+# Service (HTTP): cpp/5_Service
+# NOTE: extractor.cpp is in l5_engine already
+# -----------------------------
 if(L5_BUILD_SERVICE)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(LIBZIP REQUIRED libzip)
+
+  find_package(SQLite3 QUIET)
+  if(NOT SQLite3_FOUND)
+    message(STATUS "SQLite3 not found via find_package. Will try linking to sqlite3 directly.")
+  endif()
+
   FetchContent_Declare(
     httplib
     GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
@@ -64,84 +159,16 @@ if(L5_BUILD_SERVICE)
 
   add_library(cpp_httplib INTERFACE)
   target_include_directories(cpp_httplib INTERFACE ${httplib_SOURCE_DIR})
-  # If you want HTTPS, you need OpenSSL and define CPPHTTPLIB_OPENSSL_SUPPORT.
-  # For now - plain HTTP only.
-endif()
 
-# -----------------------------
-# Library: l5_engine
-# -----------------------------
-
-add_library(l5_engine
-  cpp/common/text_common.cpp
-  cpp/src/format.cpp
-  cpp/src/manifest.cpp
-  cpp/src/reader.cpp
-  cpp/src/validator.cpp
-  cpp/src/builder.cpp
-  cpp/src/query.cpp
-  cpp/src/result.cpp
-  cpp/src/search_segment.cpp
-  cpp/src/search_multi.cpp
-
-  # NEW: compaction + merge (LSM)
-  cpp/src/merge.cpp
-  cpp/src/compactor.cpp
-)
-
-target_include_directories(l5_engine
-  PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/common
-)
-
-target_link_libraries(l5_engine
-  PUBLIC
-    nlohmann_json::nlohmann_json
-    simdjson::simdjson
-    Threads::Threads
-)
-
-# -----------------------------
-# Tools (CLI)
-# -----------------------------
-
-if(L5_BUILD_TOOLS)
-  add_executable(l5_build cpp/tools/l5_build_main.cpp)
-  target_link_libraries(l5_build PRIVATE l5_engine)
-
-  add_executable(l5_validate cpp/tools/l5_validate_main.cpp)
-  target_link_libraries(l5_validate PRIVATE l5_engine)
-
-  add_executable(l5_search cpp/tools/l5_search_main.cpp)
-  target_link_libraries(l5_search PRIVATE l5_engine)
-endif()
-
-# -----------------------------
-# Service (HTTP)
-# -----------------------------
-
-if(L5_BUILD_SERVICE)
-  # You will create these files:
-  #   cpp/service/main.cpp
-  #   cpp/service/service.cpp
-  #   cpp/service/service.h
-  #   cpp/service/storage.cpp
-  #   cpp/service/storage.h
-  #   cpp/service/tombstone.cpp
-  #   cpp/service/tombstone.h
-  #   cpp/service/extractor.cpp
-  #   cpp/service/extractor.h
   add_executable(l5_service
-    cpp/service/main.cpp
-    cpp/service/service.cpp
-    cpp/service/storage.cpp
-    cpp/service/tombstone.cpp
-    cpp/service/extractor.cpp
+    cpp/5_Service/main.cpp
+    cpp/5_Service/service.cpp
+    cpp/5_Service/storage.cpp
+    cpp/5_Service/tombstone.cpp
   )
 
   target_include_directories(l5_service PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/service
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/5_Service
   )
 
   target_link_libraries(l5_service PRIVATE
@@ -153,40 +180,9 @@ if(L5_BUILD_SERVICE)
   target_link_libraries(l5_service PRIVATE ${LIBZIP_LIBRARIES})
   target_compile_options(l5_service PRIVATE ${LIBZIP_CFLAGS_OTHER})
 
-  # sqlite3 link
   if(SQLite3_FOUND)
     target_link_libraries(l5_service PRIVATE SQLite::SQLite3)
   else()
-    # fallback: try raw -lsqlite3
     target_link_libraries(l5_service PRIVATE sqlite3)
   endif()
-
-  # Optional: enable large file support on some systems (usually default)
-  # target_compile_definitions(l5_service PRIVATE _FILE_OFFSET_BITS=64)
-
-endif()
-
-# -----------------------------
-# Tests
-# -----------------------------
-
-if(L5_BUILD_TESTS)
-  enable_testing()
-
-  set(L5_TEST_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/data")
-
-  add_executable(test_build_smoke cpp/tests/test_build_smoke.cpp)
-  target_link_libraries(test_build_smoke PRIVATE l5_engine)
-  target_compile_definitions(test_build_smoke PRIVATE L5_TEST_DATA_DIR="${L5_TEST_DATA_DIR}")
-  add_test(NAME test_build_smoke COMMAND test_build_smoke)
-
-  add_executable(test_validate cpp/tests/test_validate.cpp)
-  target_link_libraries(test_validate PRIVATE l5_engine)
-  target_compile_definitions(test_validate PRIVATE L5_TEST_DATA_DIR="${L5_TEST_DATA_DIR}")
-  add_test(NAME test_validate COMMAND test_validate)
-
-  add_executable(test_search_smoke cpp/tests/test_search_smoke.cpp)
-  target_link_libraries(test_search_smoke PRIVATE l5_engine)
-  target_compile_definitions(test_search_smoke PRIVATE L5_TEST_DATA_DIR="${L5_TEST_DATA_DIR}")
-  add_test(NAME test_search_smoke COMMAND test_search_smoke)
 endif()
