@@ -447,6 +447,14 @@ static void copy_file_binary(const fs::path& src, const fs::path& dst) {
   if (!out) throw std::runtime_error("copy failed: " + src.string() + " -> " + dst.string());
 }
 
+static bool copy_file_best_effort(const fs::path& src, const fs::path& dst) {
+  std::error_code ec;
+  fs::create_directories(dst.parent_path(), ec);
+  ec.clear();
+  fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+  return !ec;
+}
+
 } // namespace
 
 // -------------------- L5Service --------------------
@@ -573,7 +581,7 @@ IndexTextResult L5Service::index_text_document(const std::string& org_id,
     std::ofstream out(corpus, std::ios::binary);
     if (!out) throw std::runtime_error("cannot write corpus.jsonl");
 
-    const char* text_is_normalized_flag = "true"; // backend already normalized
+    const char* text_is_normalized_flag = "false"; // core will normalize (stable contract)
 
     out
       << "{\"doc_id\":" << json(std::to_string(internal_id)).dump()
@@ -616,7 +624,7 @@ L5ZipIngestResult L5Service::ingest_l5_zip_build_segment(const std::string& org_
                                                          const std::string& zip_name,
                                                          const std::string& zip_bytes,
                                                          std::optional<unsigned> l5_shard_opt,
-                                                         const std::string& segment_name_opt) {
+                                                         const std::string& segment_name_opt,bool normalize) {
   if (org_id.empty()) throw std::invalid_argument("org_id is empty");
 
   ensure_dirs(org_root(org_id));
@@ -661,6 +669,7 @@ L5ZipIngestResult L5Service::ingest_l5_zip_build_segment(const std::string& org_
     bool needs_convert{false};
     fs::path text_path;         // final txt path to read
     int64_t internal_id{0};
+    std::string upload_rel;
   };
 
   std::vector<Pending> pending;
@@ -716,10 +725,21 @@ L5ZipIngestResult L5Service::ingest_l5_zip_build_segment(const std::string& org_
     row.deleted = 0;
     row.deleted_at_utc = "";
     row.last_segment = "";
-
     d.internal_id = st.upsert_doc_get_id(row);
   }
+  const fs::path uploads_dir = org_root(org_id) / "uploads";
+  ensure_dirs(uploads_dir);
 
+  for (auto& d : pending) {
+    // сохраняем оригинальный файл (txt/doc/docx) как есть
+    const fs::path dst = uploads_dir / d.file_name; // basename
+    if (copy_file_best_effort(d.src_path, dst)) {
+      d.upload_rel = (fs::path("uploads") / d.file_name).generic_string();
+    } else {
+      // если не удалось сохранить — не ломаем индексацию, просто оставляем пустым
+      d.upload_rel.clear();
+    }
+  }
   // 4) prepare doc/docx for conversion
   for (auto& d : pending) {
     if (!d.needs_convert) {
@@ -782,7 +802,7 @@ L5ZipIngestResult L5Service::ingest_l5_zip_build_segment(const std::string& org_
   std::atomic<size_t> next{0};
 
   const std::string org_j = json(org_id).dump();
-  const char* text_is_normalized_flag = "false"; // L5 => core normalizes
+  const char* text_is_normalized_flag = normalize ? "false" : "true";
   const size_t cap = (size_t)opt.max_text_bytes_per_doc;
 
   for (unsigned t = 0; t < n_threads; ++t) {
@@ -813,7 +833,7 @@ L5ZipIngestResult L5Service::ingest_l5_zip_build_segment(const std::string& org_
             << "{\"doc_id\":" << json(std::to_string(d.internal_id)).dump()
             << ",\"organization_id\":" << org_j
             << ",\"external_id\":" << json(d.source_id).dump()
-            << ",\"source_path\":" << json("").dump()
+            << ",\"source_path\":" << json(d.upload_rel).dump()
             << ",\"source_name\":" << json(d.file_name).dump()
             << ",\"text\":" << json(text).dump()
             << ",\"text_is_normalized\":" << text_is_normalized_flag

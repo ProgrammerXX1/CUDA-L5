@@ -216,12 +216,16 @@ void tokenize_spans(const std::string& s, std::vector<TokenSpan>& out) {
     const size_t n = s.size();
     size_t i = 0;
 
+    auto is_ws = [](unsigned char c) -> bool {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+    };
+
     while (i < n) {
-        while (i < n && s[i] == ' ') ++i;
+        while (i < n && is_ws((unsigned char)s[i])) ++i;
         if (i >= n) break;
 
         const size_t start = i;
-        while (i < n && s[i] != ' ') ++i;
+        while (i < n && !is_ws((unsigned char)s[i])) ++i;
         const size_t len = i - start;
 
         if (len > 0) {

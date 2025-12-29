@@ -47,7 +47,7 @@ public:
                                                 const std::string& zip_name,
                                                 const std::string& zip_bytes,
                                                 std::optional<unsigned> l5_shard_opt,
-                                                const std::string& segment_name_opt);
+                                                const std::string& segment_name_opt,bool normalize);
 
   // Index one document provided as TEXT (backend-normalized; no core normalization)
   IndexTextResult index_text_document(const std::string& org_id,
