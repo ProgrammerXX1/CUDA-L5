@@ -1,11 +1,84 @@
+// cpp/service/routes_process.cpp
 #include "routes.h"
 #include "route_utils.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
 #include "l5/result.h"
+
+namespace {
+
+static inline int clamp_pct(int v) {
+  if (v < 0) return 0;
+  if (v > 100) return 100;
+  return v;
+}
+
+// bbox по match_spans (в координатах шинглов: q_from/q_to и d_from/d_to включительно)
+static bool bbox_from_spans(const std::vector<l5::MatchSpan>& sp,
+                            uint32_t& q_from, uint32_t& q_to,
+                            uint32_t& d_from, uint32_t& d_to) {
+  if (sp.empty()) return false;
+
+  q_from = std::numeric_limits<uint32_t>::max();
+  d_from = std::numeric_limits<uint32_t>::max();
+  q_to = 0;
+  d_to = 0;
+
+  for (const auto& s : sp) {
+    if (s.q_from < q_from) q_from = s.q_from;
+    if (s.q_to   > q_to)   q_to   = s.q_to;
+    if (s.d_from < d_from) d_from = s.d_from;
+    if (s.d_to   > d_to)   d_to   = s.d_to;
+  }
+
+  return (q_from != std::numeric_limits<uint32_t>::max()) &&
+         (d_from != std::numeric_limits<uint32_t>::max()) &&
+         (q_to >= q_from) && (d_to >= d_from);
+}
+
+static inline void clamp_bbox(uint32_t& from, uint32_t& to, uint32_t total) {
+  if (total == 0) { from = 0; to = 0; return; }
+  if (from >= total) { from = total; to = total; return; }
+  if (to >= total) to = total - 1;
+  if (to < from) to = from;
+}
+
+// Возвращает q/s offset+limit для matchsources.
+// По умолчанию: вся длина (q_total/d_total). Если есть spans — bbox (минимальный отрезок, покрывающий матч).
+static void make_match_ranges(const l5::Hit& h,
+                              uint32_t fallback_q_total,
+                              uint32_t& q_off, uint32_t& q_lim,
+                              uint32_t& s_off, uint32_t& s_lim) {
+  const uint32_t q_total = (h.q_total > 0) ? h.q_total : fallback_q_total;
+  const uint32_t d_total = h.d_total;
+
+  q_off = 0;
+  q_lim = q_total;          // limit = длина отрезка
+  s_off = 0;
+  s_lim = d_total;          // limit = длина отрезка
+
+  uint32_t q_from=0, q_to=0, d_from=0, d_to=0;
+  if (!bbox_from_spans(h.match_spans, q_from, q_to, d_from, d_to)) {
+    // нет spans — оставляем “весь документ”
+    return;
+  }
+
+  if (q_total > 0) clamp_bbox(q_from, q_to, q_total);
+  if (d_total > 0) clamp_bbox(d_from, d_to, d_total);
+
+  q_off = q_from;
+  q_lim = (q_to >= q_from) ? (q_to - q_from + 1) : 0;
+
+  s_off = d_from;
+  s_lim = (d_to >= d_from) ? (d_to - d_from + 1) : 0;
+}
+
+} // namespace
 
 void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
   app.Post(R"(/v1/process)", [&](const httplib::Request& req, httplib::Response& res) {
@@ -91,22 +164,34 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
       r.query = text;
       r.segments_scanned = r_small.segments_scanned + r_l5.segments_scanned;
 
+      // best per doc_id (выбираем по максимальному покрытию запроса, а не по смешанному C)
       std::unordered_map<std::string, l5::Hit> best;
       best.reserve(r_small.hits.size() + r_l5.hits.size());
 
-      auto push_hits = [&](std::vector<l5::Hit>&& hits){
-        for (auto& h : hits) {
+      auto push_hits = [&](std::vector<l5::Hit>&& hv) {
+        for (auto& h : hv) {
           auto it = best.find(h.doc_id);
-          if (it == best.end() || h.C > it->second.C) best[h.doc_id] = std::move(h);
+          if (it == best.end()) {
+            best.emplace(h.doc_id, std::move(h));
+            continue;
+          }
+          const bool better =
+              (h.Cq > it->second.Cq) ||
+              (h.Cq == it->second.Cq && h.C > it->second.C) ||
+              (h.Cq == it->second.Cq && h.C == it->second.C && h.matched_shingles > it->second.matched_shingles);
+          if (better) it->second = std::move(h);
         }
       };
+
       push_hits(std::move(r_small.hits));
       push_hits(std::move(r_l5.hits));
 
       r.hits.reserve(best.size());
       for (auto& kv : best) r.hits.push_back(std::move(kv.second));
 
-      std::sort(r.hits.begin(), r.hits.end(), [](const l5::Hit& a, const l5::Hit& b){
+      // сортируем по Cq (важно для UX и для “копия текста”)
+      std::sort(r.hits.begin(), r.hits.end(), [](const l5::Hit& a, const l5::Hit& b) {
+        if (a.Cq != b.Cq) return a.Cq > b.Cq;
         return a.C > b.C;
       });
       if (r.hits.size() > opt.topk) r.hits.resize(opt.topk);
@@ -118,9 +203,10 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
         hits.push_back(std::move(h));
       }
 
+      // BUGFIX #1: plagiarism_percentage должен опираться на Cq (coverage query), а не на C (alpha-mix)
       int plagiarism = 0;
       for (const auto& h : hits) {
-        int c = (int)(h.C + 0.5);
+        int c = clamp_pct((int)std::lround(h.Cq));
         if (c > plagiarism) plagiarism = c;
       }
 
@@ -156,7 +242,9 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
       matchsources.reserve(hits.size());
 
       int ms_seq = 1;
-      const int q_limit = (int)text.size();
+
+      // fallback для q_total, если вдруг h.q_total==0
+      const uint32_t fallback_q_total = (uint32_t)text.size();
 
       for (const auto& h : hits) {
         int64_t iid = safe_stoll(h.doc_id);
@@ -181,13 +269,17 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
           {"index_date", idx_date}
         });
 
+        // BUGFIX #2: s_offset/s_limit должны идти от документа (match_spans: d_from/d_to), а не из query.
+        uint32_t q_off=0, q_lim=0, s_off=0, s_lim=0;
+        make_match_ranges(h, fallback_q_total, q_off, q_lim, s_off, s_lim);
+
         matchsources.push_back({
           {"id", std::to_string(ms_seq++)},
           {"source_id", h.doc_id},
-          {"q_offset", 0},
-          {"q_limit", q_limit},
-          {"s_offset", 0},
-          {"s_limit", q_limit},
+          {"q_offset", (int)q_off},
+          {"q_limit",  (int)q_lim},
+          {"s_offset", (int)s_off},
+          {"s_limit",  (int)s_lim},
           {"type", "1"}
         });
       }
