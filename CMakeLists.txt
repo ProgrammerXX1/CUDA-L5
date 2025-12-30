@@ -161,15 +161,32 @@ if(L5_BUILD_SERVICE)
   target_include_directories(cpp_httplib INTERFACE ${httplib_SOURCE_DIR})
 
   add_executable(l5_service
-    cpp/5_Service/main.cpp
-    cpp/5_Service/service.cpp
-    cpp/5_Service/storage.cpp
-    cpp/5_Service/tombstone.cpp
-  )
+  cpp/5_Service/main.cpp
+  
+  cpp/5_Service/core/service_common.cpp
+  cpp/5_Service/core/service_ingest.cpp
+  cpp/5_Service/core/service_search.cpp
+  cpp/5_Service/core/service_compact.cpp
+
+  cpp/5_Service/storage.cpp
+  cpp/5_Service/tombstone.cpp
+
+  cpp/5_Service/routes/register_all.cpp
+  cpp/5_Service/routes/route_utils.cpp
+  cpp/5_Service/routes/route_ingest_zip.cpp
+  cpp/5_Service/routes/route_debug_normalized_text.cpp
+  cpp/5_Service/routes/route_rebuild_one.cpp
+  cpp/5_Service/routes/route_rebuild_info.cpp
+  cpp/5_Service/routes/route_segment_docs.cpp
+  cpp/5_Service/routes/route_process.cpp
+  cpp/5_Service/routes/route_admin_compact.cpp
+  cpp/5_Service/routes/route_admin_wipe_all.cpp
+)
 
   target_include_directories(l5_service PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/5_Service
-  )
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/5_Service
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/5_Service/routes
+)
 
   target_link_libraries(l5_service PRIVATE
     l5_engine

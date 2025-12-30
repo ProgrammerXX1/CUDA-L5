@@ -8,7 +8,18 @@
 #include <stdexcept>
 #include <string_view>
 
+
 namespace {
+
+static inline bool text_trace_enabled() {
+    static int enabled = []() -> int {
+        const char* v = std::getenv("L5_TEXT_TRACE");
+        if (!v || !*v) return 0;
+        if (v[0] == '0') return 0;
+        return 1;
+    }();
+    return enabled != 0;
+}
 
 struct Utf8Dec {
     uint32_t cp{0};
@@ -167,10 +178,9 @@ static inline uint32_t to_lower_ru_kz(uint32_t cp) {
 
     // Cyrillic А..Я -> а..я
     if (cp >= 0x0410 && cp <= 0x042F) return cp + 0x20;
-    // Ё
-    if (cp == 0x0401) return 0x0451;
-    // І
-    if (cp == 0x0406) return 0x0456;
+
+    // Cyrillic 0x0400..0x040F map to 0x0450..0x045F
+    if (cp >= 0x0400 && cp <= 0x040F) return cp + 0x50;
 
     // Kazakh uppercase -> lowercase
     if (cp == 0x04D8) return 0x04D9; // Ә
@@ -270,6 +280,9 @@ void normalize_for_shingles_simple_to(std::string_view s, std::string& out) {
 
         i += d.len;
     }
+    if (text_trace_enabled()) {
+    std::fprintf(stderr, "[text_common] normalize in=%zu out=%zu\n", s.size(), out.size());
+}
 
     if (!out.empty() && out.back() == ' ') out.pop_back();
 }
@@ -297,6 +310,42 @@ void tokenize_spans(const std::string& s, std::vector<TokenSpan>& out) {
             step = 2;
             return true;
         }
+
+        // Common Unicode spaces (when tokenize_spans is used on non-normalized text)
+        if (c == 0xE2 && idx + 2 < n && (unsigned char)s[idx + 1] == 0x80) {
+            const unsigned char c2 = (unsigned char)s[idx + 2];
+            // U+2000..U+200B (0x80..0x8B), U+2028/2029 (0xA8/0xA9), U+202F (0xAF)
+            if ((c2 >= 0x80 && c2 <= 0x8B) || c2 == 0xA8 || c2 == 0xA9 || c2 == 0xAF) {
+                step = 3;
+                return true;
+            }
+        }
+        // U+205F: 0xE2 0x81 0x9F
+        if (c == 0xE2 && idx + 2 < n && (unsigned char)s[idx + 1] == 0x81 &&
+            (unsigned char)s[idx + 2] == 0x9F) {
+            step = 3;
+            return true;
+        }
+        // U+1680: 0xE1 0x9A 0x80
+        if (c == 0xE1 && idx + 2 < n && (unsigned char)s[idx + 1] == 0x9A &&
+            (unsigned char)s[idx + 2] == 0x80) {
+            step = 3;
+            return true;
+        }
+        // U+3000: 0xE3 0x80 0x80
+        if (c == 0xE3 && idx + 2 < n && (unsigned char)s[idx + 1] == 0x80 &&
+            (unsigned char)s[idx + 2] == 0x80) {
+            step = 3;
+            return true;
+        }
+        // U+FEFF (BOM / ZWNBSP): 0xEF 0xBB 0xBF
+        if (c == 0xEF && idx + 2 < n && (unsigned char)s[idx + 1] == 0xBB &&
+            (unsigned char)s[idx + 2] == 0xBF) {
+            step = 3;
+            return true;
+        }
+
+
         step = 1;
         return false;
     };
@@ -325,6 +374,10 @@ void tokenize_spans(const std::string& s, std::vector<TokenSpan>& out) {
             out.push_back(ts);
         }
     }
+    if (text_trace_enabled()) {
+    std::fprintf(stderr, "[text_common] tokenize bytes=%zu tokens=%zu\n", s.size(), out.size());
+}
+
 }
 
 // FNV-1a 64-bit
@@ -336,11 +389,25 @@ static inline uint64_t fnv1a64_mix(uint64_t h, unsigned char c) {
 }
 
 static inline uint64_t hash_token_bytes_internal(const std::string& s, const TokenSpan& t) {
+    const size_t a = (size_t)t.start;
+    const size_t b = a + (size_t)t.len;
+    if (b < a || b > s.size()) {
+        throw std::out_of_range("TokenSpan out of range");
+    }
+    
     uint64_t h = fnv1a64_init();
-    const uint32_t a = t.start;
-    const uint32_t b = t.start + t.len;
-    for (uint32_t i = a; i < b; ++i) h = fnv1a64_mix(h, (unsigned char)s[i]);
+    for (size_t i = a; i < b; ++i) h = fnv1a64_mix(h, (unsigned char)s[i]);
     return h;
+}
+
+static inline void validate_shingle_args(size_t n_tokens, int pos, int K) {
+    if (pos < 0) throw std::invalid_argument("pos must be >= 0");
+    if (K <= 0) throw std::invalid_argument("K must be > 0");
+
+    const size_t upos = (size_t)pos;
+    const size_t uK = (size_t)K;
+    if (upos > n_tokens) throw std::out_of_range("pos out of range");
+    if (uK > n_tokens - upos) throw std::out_of_range("pos+K out of range");
 }
 
 uint64_t hash_shingle_tokens_spans(const std::string& s,
@@ -351,6 +418,7 @@ uint64_t hash_shingle_tokens_spans(const std::string& s,
     assert(K > 0);
     assert((size_t)pos <= spans.size());
     assert((size_t)(pos + K) <= spans.size());
+    validate_shingle_args(spans.size(), pos, K);
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     const int end = pos + K;
     for (int i = pos; i < end; ++i) {
@@ -397,6 +465,7 @@ uint64_t hash_shingle_token_hashes(const std::vector<uint64_t>& token_hashes,
     assert(K > 0);
     assert((size_t)pos <= token_hashes.size());
     assert((size_t)(pos + K) <= token_hashes.size());
+    validate_shingle_args(token_hashes.size(), pos, K);
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     const int end = pos + K;
     for (int i = pos; i < end; ++i) {

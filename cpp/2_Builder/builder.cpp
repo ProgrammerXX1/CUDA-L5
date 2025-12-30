@@ -1,5 +1,6 @@
 #include "l5/builder.h"
 #include "l5/format.h"
+#include <filesystem>
 #include "l5/manifest.h"
 #include "l5/docinfo.h"
 #include "l5/errors.h"
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <sstream>
@@ -91,6 +93,16 @@ static bool env_bool(const char* key, bool defv) {
     return defv;
 }
 
+static bool segment_name_is_safe(const std::string& s) {
+    if (s.empty()) return false;
+    if (s == "." || s == "..") return false;
+    if (s.find('/') != std::string::npos) return false;
+    if (s.find('\\') != std::string::npos) return false;
+    if (s.find("..") != std::string::npos) return false;
+    return true;
+}
+
+
 static bool has_key(const simdjson::dom::element& e, const char* key) {
     simdjson::dom::element tmp;
     return !e.at_key(key).get(tmp);
@@ -158,12 +170,11 @@ static inline std::string_view clip_text_view(std::string_view s, uint32_t max_b
     if (max_bytes == 0) return s;
     if (s.size() <= (size_t)max_bytes) return s;
 
-    if (text_is_norm) {
-        const size_t cut = utf8_safe_prefix_len(s, (size_t)max_bytes);
-        return s.substr(0, cut);
-    }
-    // не нормализован: можно резать по байтам, normalize_for_shingles_simple_to переживёт
-    return s.substr(0, (size_t)max_bytes);
+    (void)text_is_norm;
+    // Всегда режем UTF-8-safe (инвариант: нельзя резать посреди UTF-8 символа).
+    // Даже если вход не нормализован, дальнейшая нормализация/токенизация должна получать валидный UTF-8 префикс.
+    const size_t cut = utf8_safe_prefix_len(s, (size_t)max_bytes);
+    return s.substr(0, cut);
 }
 
 // --------------------
@@ -428,7 +439,9 @@ static void partition_postings_to_buckets(const std::vector<fs::path>& inputs,
 
     for (const auto& in_path : inputs) {
         std::ifstream in(in_path, std::ios::binary);
-        if (!in) continue;
+        if (!in) {
+            throw L5Exception("cannot open postings tmp for read: " + in_path.string());
+        }
 
         while (true) {
             const size_t got = read_p9_chunk(in, block, BLOCK_RECS);
@@ -592,8 +605,24 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
 
     BuildStats st;
 
+    // hard safety caps (bounded memory even on misconfig)
+    static constexpr uint32_t kHardMaxTextBytes = 256u * 1024u * 1024u;   // 256 MiB
+    static constexpr uint32_t kHardMaxInflight  = 4096u;                  // queue/window cap
+    static constexpr uint32_t kHardMaxTokens    = 1'000'000u;             // prevent huge vectors
+    if (opt.max_text_bytes_per_doc > kHardMaxTextBytes) opt.max_text_bytes_per_doc = kHardMaxTextBytes;
+    if (opt.inflight_docs > kHardMaxInflight) opt.inflight_docs = kHardMaxInflight;
+    if (opt.max_tokens_per_doc > kHardMaxTokens) opt.max_tokens_per_doc = kHardMaxTokens;
+
     std::string segment_name = opt.segment_name;
-    if (segment_name.empty()) segment_name = std::string("seg_") + utc_now_compact();
+    if (segment_name.empty()) {
+        segment_name = std::string("seg_") + utc_now_compact();
+    }
+    if (segment_name.empty()) {
+        segment_name = std::string("seg_") + utc_now_compact();
+    }
+    if (!segment_name_is_safe(segment_name)) {
+        throw L5Exception("bad segment_name: " + segment_name);
+    }
 
     const bool strict = opt.strict_text_is_normalized || env_bool("PLAGIO_STRICT_TEXT_IS_NORMALIZED", false);
     const std::string built_at = utc_now_compact();
@@ -602,13 +631,22 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
     fs::create_directories(out_root, ec);
     if (ec) throw L5Exception("cannot create out_root: " + out_root.string() + " err=" + ec.message());
 
-    const fs::path seg_dir = out_root / segment_name;
-    if (fs::exists(seg_dir)) throw L5Exception("segment already exists: " + seg_dir.string());
+    // Crash-safety: строим сегмент в temp-директории и только в самом конце делаем rename в финальное имя.
+    // Это предотвращает ситуацию "segment already exists" при падении посередине сборки, если segment_name задан вручную.
+    const fs::path seg_dir_final = out_root / segment_name;
+    if (fs::exists(seg_dir_final)) throw L5Exception("segment already exists: " + seg_dir_final.string());
 
-    fs::create_directories(seg_dir, ec);
-    if (ec) throw L5Exception("cannot create segment dir: " + seg_dir.string() + " err=" + ec.message());
+    const fs::path seg_dir_build = out_root / (segment_name + ".__building__");
+    if (fs::exists(seg_dir_build)) {
+        std::error_code ec_rm;
+        fs::remove_all(seg_dir_build, ec_rm); // best-effort cleanup от прошлой неудачной попытки
+    }
 
-    SegCleanupOnFail cleanup{seg_dir};
+    fs::create_directories(seg_dir_build, ec);
+    if (ec) throw L5Exception("cannot create segment build dir: " + seg_dir_build.string() + " err=" + ec.message());
+ 
+
+    SegCleanupOnFail cleanup{seg_dir_build};
 
     // derive threads / inflight bounds
     unsigned hw = std::thread::hardware_concurrency();
@@ -623,17 +661,17 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
     const uint32_t window = std::max<uint32_t>(1u, opt.inflight_docs);
 
     // temp paths
-    const fs::path bin_fin  = seg_dir / "index_native.bin";
-    const fs::path doc_fin  = seg_dir / "index_native_docids.json";
-    const fs::path meta_fin = seg_dir / "index_native_meta.json";
-
-    const fs::path bin_tmp  = seg_dir / "index_native.bin.tmp";
-    const fs::path doc_tmp  = seg_dir / "index_native_docids.json.tmp";
-    const fs::path meta_tmp = seg_dir / "index_native_meta.json.tmp";
-
-    const fs::path docmeta_tmp = seg_dir / "index_native_docmeta.bin.tmp";
-
-    const fs::path tmp_dir = seg_dir / "_tmp_build";
+    const fs::path bin_fin  = seg_dir_build / "index_native.bin";
+    const fs::path doc_fin  = seg_dir_build / "index_native_docids.json";
+    const fs::path meta_fin = seg_dir_build / "index_native_meta.json";
+ 
+    const fs::path bin_tmp  = seg_dir_build / "index_native.bin.tmp";
+    const fs::path doc_tmp  = seg_dir_build / "index_native_docids.json.tmp";
+    const fs::path meta_tmp = seg_dir_build / "index_native_meta.json.tmp";
+ 
+    const fs::path docmeta_tmp = seg_dir_build / "index_native_docmeta.bin.tmp";
+ 
+    const fs::path tmp_dir = seg_dir_build / "_tmp_build";
     fs::create_directories(tmp_dir, ec);
 
     // postings worker files
@@ -1067,6 +1105,20 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
     if (!atomic_replace_file_best_effort(doc_tmp, doc_fin)) throw L5Exception("atomic replace failed (docids)");
     if (!atomic_replace_file_best_effort(meta_tmp, meta_fin)) throw L5Exception("atomic replace failed (meta)");
 
+    // cleanup temp build artifacts (best effort) before directory rename
+    {
+        std::error_code ec3;
+        fs::remove_all(tmp_dir, ec3);
+        fs::remove(docmeta_tmp, ec3);
+    }
+
+    // publish: rename build-dir -> final-dir (atomic within same filesystem)
+    fs::rename(seg_dir_build, seg_dir_final, ec);
+    if (ec) throw L5Exception("publish rename failed: " + seg_dir_build.string() + " -> " + seg_dir_final.string() + " err=" + ec.message());
+
+    // from here: if anything fails (e.g. manifest append), rollback should delete FINAL dir
+    cleanup.p = seg_dir_final;
+
     SegmentEntry e;
     e.segment_name = segment_name;
     e.path = segment_name + "/";
@@ -1077,15 +1129,8 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
 
     if (!append_segment_to_manifest(out_root, e)) throw L5Exception("manifest append failed");
 
-    // cleanup temp dir (best effort)
-    {
-        std::error_code ec3;
-        fs::remove_all(tmp_dir, ec3);
-        fs::remove(docmeta_tmp, ec3);
-    }
-
     st.segment_name = segment_name;
-    st.seg_dir = seg_dir;
+    st.seg_dir = seg_dir_final;
     st.docs = N_docs;
     st.post9 = N_post9;
     st.threads = num_threads;
