@@ -18,7 +18,7 @@ static inline int clamp_pct(int v) {
   return v;
 }
 
-// bbox по match_spans (в координатах шинглов: q_from/q_to и d_from/d_to включительно)
+// bbox по match_spans (координаты шинглов), inclusive
 static bool bbox_from_spans(const std::vector<l5::MatchSpan>& sp,
                             uint32_t& q_from, uint32_t& q_to,
                             uint32_t& d_from, uint32_t& d_to) {
@@ -48,8 +48,9 @@ static inline void clamp_bbox(uint32_t& from, uint32_t& to, uint32_t total) {
   if (to < from) to = from;
 }
 
-// Возвращает q/s offset+limit для matchsources.
-// По умолчанию: вся длина (q_total/d_total). Если есть spans — bbox (минимальный отрезок, покрывающий матч).
+// q/s offset+limit:
+// - если есть spans: bbox по spans
+// - иначе: (0, q_total) и (0, d_total)
 static void make_match_ranges(const l5::Hit& h,
                               uint32_t fallback_q_total,
                               uint32_t& q_off, uint32_t& q_lim,
@@ -58,15 +59,12 @@ static void make_match_ranges(const l5::Hit& h,
   const uint32_t d_total = h.d_total;
 
   q_off = 0;
-  q_lim = q_total;          // limit = длина отрезка
+  q_lim = q_total;
   s_off = 0;
-  s_lim = d_total;          // limit = длина отрезка
+  s_lim = d_total;
 
   uint32_t q_from=0, q_to=0, d_from=0, d_to=0;
-  if (!bbox_from_spans(h.match_spans, q_from, q_to, d_from, d_to)) {
-    // нет spans — оставляем “весь документ”
-    return;
-  }
+  if (!bbox_from_spans(h.match_spans, q_from, q_to, d_from, d_to)) return;
 
   if (q_total > 0) clamp_bbox(q_from, q_to, q_total);
   if (d_total > 0) clamp_bbox(d_from, d_to, d_total);
@@ -86,31 +84,57 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
       constexpr unsigned SMALL_FANOUT = 20;
 
       if (req.body.size() > ctx.max_json_body_bytes) {
-        reply_json(res, 413, {{"error","json body too large"}, {"max_bytes", (uint64_t)ctx.max_json_body_bytes}});
+        json err;
+        err["error"] = "json body too large";
+        err["max_bytes"] = (uint64_t)ctx.max_json_body_bytes;
+        reply_json(res, 413, err);
         return;
       }
 
       json j;
       try { j = json::parse(req.body); }
-      catch (...) { reply_json(res, 400, {{"error","invalid json"}}); return; }
+      catch (...) {
+        json err; err["error"] = "invalid json";
+        reply_json(res, 400, err);
+        return;
+      }
 
       const std::string org_id = parse_org_id_str(j);
-      if (!is_safe_org_id(org_id)) { reply_json(res, 400, {{"error","bad organization_id"}}); return; }
+      if (!is_safe_org_id(org_id)) {
+        json err; err["error"] = "bad organization_id";
+        reply_json(res, 400, err);
+        return;
+      }
 
       const std::string document_id = j.value("document_id", "");
-      if (document_id.empty()) { reply_json(res, 400, {{"error","document_id is required"}}); return; }
+      if (document_id.empty()) {
+        json err; err["error"] = "document_id is required";
+        reply_json(res, 400, err);
+        return;
+      }
 
       const std::string file_name = j.value("file_name", "");
-      if (file_name.empty()) { reply_json(res, 400, {{"error","file_name is required"}}); return; }
+      if (file_name.empty()) {
+        json err; err["error"] = "file_name is required";
+        reply_json(res, 400, err);
+        return;
+      }
 
       const std::string title = j.value("title", "");
       const std::string author = j.value("author", "");
       const std::string created_at = j.value("created_at", "");
 
       const std::string text = j.value("text", "");
-      if (text.empty()) { reply_json(res, 400, {{"error","text is required"}}); return; }
+      if (text.empty()) {
+        json err; err["error"] = "text is required";
+        reply_json(res, 400, err);
+        return;
+      }
       if (text.size() > ctx.max_text_bytes) {
-        reply_json(res, 413, {{"error","text too large"}, {"max_bytes", (uint64_t)ctx.max_text_bytes}});
+        json err;
+        err["error"] = "text too large";
+        err["max_bytes"] = (uint64_t)ctx.max_text_bytes;
+        reply_json(res, 413, err);
         return;
       }
 
@@ -118,7 +142,8 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
       const bool do_search = parse_bool_json(j, "do_search", true);
 
       if (!do_index && !do_search) {
-        reply_json(res, 400, {{"error","nothing to do: both do_index and do_search are false"}});
+        json err; err["error"] = "nothing to do: both do_index and do_search are false";
+        reply_json(res, 400, err);
         return;
       }
 
@@ -129,20 +154,22 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
       }
 
       if (!do_search) {
-        json out = {
-          {"document_id", document_id},
-          {"status", "indexed"},
-          {"processed_at", L5Service::utc_now_iso_utc()},
-          {"indexed", do_index ? 1 : 0},
-          {"indexed_internal_id", indexed.has_value() ? json(std::to_string(indexed->doc.id)) : json(nullptr)},
-          {"last_segment", indexed.has_value() ? json(indexed->doc.last_segment) : json(nullptr)}
-        };
+        json out;
+        out["document_id"] = document_id;
+        out["status"] = "indexed";
+        out["processed_at"] = L5Service::utc_now_iso_utc();
+        out["indexed"] = do_index ? 1 : 0;
+        out["indexed_internal_id"] = indexed.has_value() ? json(std::to_string(indexed->doc.id)) : json(nullptr);
+        out["last_segment"] = indexed.has_value() ? json(indexed->doc.last_segment) : json(nullptr);
         reply_json(res, 200, out);
         return;
       }
 
       if (text.size() > ctx.max_query_bytes) {
-        reply_json(res, 413, {{"error","query too large"}, {"max_bytes",(uint64_t)ctx.max_query_bytes}});
+        json err;
+        err["error"] = "query too large";
+        err["max_bytes"] = (uint64_t)ctx.max_query_bytes;
+        reply_json(res, 413, err);
         return;
       }
 
@@ -160,11 +187,7 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
       auto r_l5 = ctx.svc->search_levels(org_id, text, /*query_is_normalized=*/false,
                                          std::vector<int>{5}, std::vector<unsigned>{}, opt);
 
-      l5::SearchResult r;
-      r.query = text;
-      r.segments_scanned = r_small.segments_scanned + r_l5.segments_scanned;
-
-      // best per doc_id (выбираем по максимальному покрытию запроса, а не по смешанному C)
+      // best per doc_id: выбираем по лучшему Cq (покрытие запроса)
       std::unordered_map<std::string, l5::Hit> best;
       best.reserve(r_small.hits.size() + r_l5.hits.size());
 
@@ -182,34 +205,38 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
           if (better) it->second = std::move(h);
         }
       };
-
       push_hits(std::move(r_small.hits));
       push_hits(std::move(r_l5.hits));
 
-      r.hits.reserve(best.size());
-      for (auto& kv : best) r.hits.push_back(std::move(kv.second));
+      std::vector<l5::Hit> hits;
+      hits.reserve(best.size());
+      for (auto& kv : best) hits.push_back(std::move(kv.second));
 
-      // сортируем по Cq (важно для UX и для “копия текста”)
-      std::sort(r.hits.begin(), r.hits.end(), [](const l5::Hit& a, const l5::Hit& b) {
+      std::sort(hits.begin(), hits.end(), [](const l5::Hit& a, const l5::Hit& b) {
         if (a.Cq != b.Cq) return a.Cq > b.Cq;
         return a.C > b.C;
       });
-      if (r.hits.size() > opt.topk) r.hits.resize(opt.topk);
+      if (hits.size() > opt.topk) hits.resize(opt.topk);
 
-      std::vector<l5::Hit> hits;
-      hits.reserve(r.hits.size());
-      for (auto& h : r.hits) {
-        if (do_index && !h.external_id.empty() && h.external_id == document_id) continue;
-        hits.push_back(std::move(h));
+      // exclude self-hit for do_index
+      if (do_index) {
+        std::vector<l5::Hit> filtered;
+        filtered.reserve(hits.size());
+        for (auto& h : hits) {
+          if (!h.external_id.empty() && h.external_id == document_id) continue;
+          filtered.push_back(std::move(h));
+        }
+        hits.swap(filtered);
       }
 
-      // BUGFIX #1: plagiarism_percentage должен опираться на Cq (coverage query), а не на C (alpha-mix)
+      // plagiarism = max(Cq)
       int plagiarism = 0;
       for (const auto& h : hits) {
         int c = clamp_pct((int)std::lround(h.Cq));
         if (c > plagiarism) plagiarism = c;
       }
 
+      // fetch docs meta
       std::vector<int64_t> ids;
       ids.reserve(hits.size());
       for (const auto& h : hits) {
@@ -222,6 +249,7 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
       by_id.reserve(docs.size() * 2);
       for (auto& d : docs) by_id[d.id] = std::move(d);
 
+      // modules table
       std::unordered_map<std::string, std::string> module_ids;
       std::vector<json> modules;
       modules.reserve(64);
@@ -230,9 +258,14 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
       auto get_module_id = [&](const std::string& name) -> std::string {
         auto it = module_ids.find(name);
         if (it != module_ids.end()) return it->second;
-        std::string id = std::to_string(mod_seq++);
+
+        const std::string id = std::to_string(mod_seq++);
         module_ids[name] = id;
-        modules.push_back({{"id", id}, {"module_name", name}});
+
+        json m;
+        m["id"] = id;
+        m["module_name"] = name;
+        modules.push_back(std::move(m));
         return id;
       };
 
@@ -242,8 +275,6 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
       matchsources.reserve(hits.size());
 
       int ms_seq = 1;
-
-      // fallback для q_total, если вдруг h.q_total==0
       const uint32_t fallback_q_total = (uint32_t)text.size();
 
       for (const auto& h : hits) {
@@ -259,49 +290,52 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
         const std::string mod_id =
             h.meta_path.empty() ? get_module_id("unknown") : get_module_id(h.meta_path);
 
-        sources.push_back({
-          {"id", h.doc_id},
-          {"source_id", h.external_id},
-          {"module_id", mod_id},
-          {"name", name},
-          {"url", nullptr},
-          {"author", auth},
-          {"index_date", idx_date}
-        });
+        // sources item in required field order
+        json s;
+        s["id"] = h.doc_id;
+        s["source_id"] = h.external_id;
+        s["module_id"] = mod_id;
+        s["name"] = name;
+        s["url"] = nullptr;
+        s["author"] = auth;
+        s["index_date"] = idx_date;
+        sources.push_back(std::move(s));
 
-        // BUGFIX #2: s_offset/s_limit должны идти от документа (match_spans: d_from/d_to), а не из query.
+        // matchsources item in required field order
         uint32_t q_off=0, q_lim=0, s_off=0, s_lim=0;
         make_match_ranges(h, fallback_q_total, q_off, q_lim, s_off, s_lim);
 
-        matchsources.push_back({
-          {"id", std::to_string(ms_seq++)},
-          {"source_id", h.doc_id},
-          {"q_offset", (int)q_off},
-          {"q_limit",  (int)q_lim},
-          {"s_offset", (int)s_off},
-          {"s_limit",  (int)s_lim},
-          {"type", "1"}
-        });
+        json ms;
+        ms["id"] = std::to_string(ms_seq++);
+        ms["source_id"] = h.doc_id;
+        ms["q_offset"] = (int)q_off;
+        ms["q_limit"]  = (int)q_lim;
+        ms["s_offset"] = (int)s_off;
+        ms["s_limit"]  = (int)s_lim;
+        ms["type"] = "1";
+        matchsources.push_back(std::move(ms));
       }
 
-      json out = {
-        {"document_id", document_id},
-        {"status", "completed"},
-        {"processed_at", L5Service::utc_now_iso_utc()},
-        {"plagiarism_percentage", plagiarism},
-        {"selfcite_percentage", 0},
-        {"legal_percentage", 0},
-        {"unknown_percentage", 0},
-        {"sources", sources},
-        {"matchsources", matchsources},
-        {"modules", modules}
-      };
+      // TOP-LEVEL output in required order
+      json out;
+      out["document_id"] = document_id;
+      out["status"] = "completed";
+      out["processed_at"] = L5Service::utc_now_iso_utc();
+      out["plagiarism_percentage"] = plagiarism;
+      out["selfcite_percentage"] = 0;
+      out["legal_percentage"] = 0;
+      out["unknown_percentage"] = 0;
+      out["sources"] = sources;
+      out["matchsources"] = matchsources;
+      out["modules"] = modules;
 
       reply_json(res, 200, out);
     } catch (const std::invalid_argument& e) {
-      reply_json(res, 400, {{"error", e.what()}});
+      json err; err["error"] = e.what();
+      reply_json(res, 400, err);
     } catch (const std::exception& e) {
-      reply_json(res, 500, {{"error", e.what()}});
+      json err; err["error"] = e.what();
+      reply_json(res, 500, err);
     }
   });
 }

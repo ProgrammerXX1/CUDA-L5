@@ -12,11 +12,10 @@
 #include "l5/manifest.h"
 
 namespace fs = std::filesystem;
-using json = nlohmann::json;
+using json = nlohmann::ordered_json;
 
 // helpers
 void reply_json(httplib::Response& res, int status, const json& j);
-
 std::string to_lower_copy(std::string s);
 bool parse_bool_str(const std::string& v, bool defv);
 bool parse_bool_json(const json& j, const char* key, bool defv);
