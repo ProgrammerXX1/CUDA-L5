@@ -6,17 +6,54 @@
 #include "l5/merge.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
 namespace l5 {
 
 namespace {
+
+static bool is_safe_segment_name(std::string_view s) {
+    if (s.empty()) return false;
+    if (s == "." || s == "..") return false;
+    if (s.find('/')  != std::string_view::npos) return false;
+    if (s.find('\\') != std::string_view::npos) return false;
+    for (unsigned char c : s) {
+        if (!(std::isalnum(c) || c == '_' || c == '-' || c == '.')) return false;
+    }
+    return true;
+}
+
+#if !defined(_WIN32)
+class CompactionLock {
+    int fd_ = -1;
+public:
+    explicit CompactionLock(const fs::path& root) {
+        const auto p = (root / ".level5_compactor.lock").string();
+        fd_ = ::open(p.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+        if (fd_ < 0) throw L5Exception("cannot open compactor lock: " + p);
+        if (::flock(fd_, LOCK_EX) != 0) throw L5Exception("flock LOCK_EX failed: " + p);
+    }
+    ~CompactionLock() { if (fd_ >= 0) { ::flock(fd_, LOCK_UN); ::close(fd_); } }
+    CompactionLock(const CompactionLock&) = delete;
+    CompactionLock& operator=(const CompactionLock&) = delete;
+};
+#else
+class CompactionLock { public: explicit CompactionLock(const fs::path&) {} };
+#endif
 
 static std::string rand_hex8() {
     std::random_device rd;
@@ -46,6 +83,7 @@ CompactResult compact_once(const fs::path& src_root,
     CompactResult rr;
 
     if (opt.fanout < 2) return rr;
+    CompactionLock comp_lk(src_root); 
 
     Manifest m;
     std::string merr;
@@ -68,6 +106,9 @@ CompactResult compact_once(const fs::path& src_root,
 
     for (unsigned i = 0; i < N; ++i) {
         const auto& e = m.segments[i];
+        if (!is_safe_segment_name(e.segment_name)) {
+            throw L5Exception("compact: unsafe segment_name in manifest: " + e.segment_name);
+        }
         to_remove.push_back(e.segment_name);
         src_seg_dirs.push_back(src_root / e.segment_name);
         in_docs += e.stats.docs;
@@ -80,39 +121,38 @@ CompactResult compact_once(const fs::path& src_root,
     fs::create_directories(out_root, ec);
 
     const std::string new_seg = gen_seg_name_compact();
+    const fs::path new_seg_dir = out_root / new_seg;
 
     // 1) build merged segment
     SegmentEntry out_e = merge_segments_sorted(out_root, new_seg, src_seg_dirs);
-
+    // cheap sanity: merged stats should match sum of inputs
+    if (out_e.stats.docs != in_docs || out_e.stats.k9 != in_k9) {
+        std::error_code ec_rm;
+        fs::remove_all(new_seg_dir, ec_rm);
+        throw L5Exception("compact: merged stats mismatch (possible corrupted inputs)");
+    }
     // 2) update manifests atomically
     if (fs::equivalent(src_root, out_root, ec) && !ec) {
-        Manifest mm;
-        std::string merr2;
-        if (!load_manifest_strict(src_root, mm, &merr2)) {
-            throw L5Exception("compact: manifest corrupted (same root): " + merr2);
+        std::string uerr;
+        if (!replace_segments_in_manifest(out_root, to_remove, out_e, &uerr)) {
+            std::error_code ec_rm;
+            fs::remove_all(new_seg_dir, ec_rm);
+            throw L5Exception("compact: manifest replace failed (same root): " + uerr);
         }
-
-        // filter out old
-        Manifest keep;
-        keep.segments.reserve(mm.segments.size());
-        for (auto& e : mm.segments) {
-            bool del = false;
-            for (const auto& s : to_remove) {
-                if (e.segment_name == s) { del = true; break; }
-            }
-            if (!del) keep.segments.push_back(std::move(e));
-        }
-        keep.segments.push_back(out_e);
-        if (!save_manifest(src_root, keep)) throw L5Exception("compact: save_manifest failed (same root)");
     } else {
-        // src: remove old
-        if (!remove_segments_from_manifest(src_root, to_remove)) {
-            throw L5Exception("compact: remove_segments_from_manifest failed");
-        }
-
         // dst: append new
         if (!append_segment_to_manifest(out_root, out_e)) {
+            std::error_code ec_rm;
+            fs::remove_all(new_seg_dir, ec_rm);
             throw L5Exception("compact: append to dst manifest failed");
+        }
+        // src: remove old
+        if (!remove_segments_from_manifest(src_root, to_remove)) {
+            // rollback best-effort: remove newly appended segment from dst + delete files
+            (void)remove_segments_from_manifest(out_root, std::vector<std::string>{new_seg});
+            std::error_code ec_rm;
+            fs::remove_all(new_seg_dir, ec_rm);
+            throw L5Exception("compact: remove_segments_from_manifest failed");
         }
     }
 

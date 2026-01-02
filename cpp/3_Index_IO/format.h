@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -41,11 +42,12 @@ bool atomic_replace_file_best_effort(const std::filesystem::path& tmp,
 // ---- format constants (v2) ----
 constexpr uint64_t HEADER_V2_BYTES    = 4 + 4 + 4 + 8 + 8; // 28
 constexpr uint64_t DOCMETA_V2_BYTES   = 4 + 8 + 8;         // 20
-constexpr uint64_t POSTING9_V2_BYTES  = 4 + 4 + 4;         // 12
+constexpr uint64_t POSTING9_V2_BYTES  = 4 + 4 + 4 + 4;     // 16
 
 // sanity: checks header vs file size and overflow risks (prevents OOM on corrupted files)
 bool header_v2_sane(const HeaderV2& h, uint64_t file_bytes, std::string* err);
 
-
+static_assert(std::is_trivially_copyable_v<Posting9>);
+static_assert(sizeof(Posting9) == POSTING9_V2_BYTES, "Posting9 disk size mismatch");
 
 } // namespace l5

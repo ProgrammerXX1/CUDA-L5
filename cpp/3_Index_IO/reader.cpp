@@ -1,6 +1,7 @@
 // Back_L5/cpp/src/reader.cpp
 #include "l5/reader.h"
 
+#include <cassert>
 #include <fstream>
 #include <filesystem>
 #include <nlohmann/json.hpp>
@@ -37,6 +38,9 @@ bool load_segment_bin(const std::filesystem::path& seg_dir, SegmentData& out, st
         return false;
     }
     out.header = h;
+    constexpr size_t DOCMETA_FIELDS_BYTES =
+        sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t);
+    static_assert(DOCMETA_FIELDS_BYTES <= (size_t)DOCMETA_V2_BYTES, "DOCMETA_V2_BYTES too small");
 
     // docmeta: read by fields (padding-safe)
     out.docmeta.resize(h.n_docs);
@@ -49,8 +53,21 @@ bool load_segment_bin(const std::filesystem::path& seg_dir, SegmentData& out, st
             if (err) *err = "failed reading docmeta";
             return false;
         }
+        if ((size_t)DOCMETA_V2_BYTES > DOCMETA_FIELDS_BYTES) {
+            const auto extra = (std::streamsize)((size_t)DOCMETA_V2_BYTES - DOCMETA_FIELDS_BYTES);
+            in.ignore(extra);
+            if (!in) {
+                if (err) *err = "failed skipping docmeta padding";
+                return false;
+            }
+        }
         out.docmeta[i] = dm;
     }
+
+    constexpr size_t POST9_FIELDS_BYTES =
+        sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t);
+    static_assert(POST9_FIELDS_BYTES <= (size_t)POSTING9_V2_BYTES, "POSTING9_V2_BYTES too small");
+
 
     // postings9: read by fields (padding-safe)
     out.postings9.resize((size_t)h.n_post9);
@@ -62,6 +79,14 @@ bool load_segment_bin(const std::filesystem::path& seg_dir, SegmentData& out, st
         if (!in) {
             if (err) *err = "failed reading postings9";
             return false;
+        }
+        if ((size_t)POSTING9_V2_BYTES > POST9_FIELDS_BYTES) {
+            const auto extra = (std::streamsize)((size_t)POSTING9_V2_BYTES - POST9_FIELDS_BYTES);
+            in.ignore(extra);
+            if (!in) {
+                if (err) *err = "failed skipping postings9 padding";
+                return false;
+            }
         }
         out.postings9[(size_t)i] = p;
     }

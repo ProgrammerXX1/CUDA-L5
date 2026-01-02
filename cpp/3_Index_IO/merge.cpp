@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <queue>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
@@ -48,6 +49,13 @@ static void json_write_string(std::ostream& os, std::string_view s) {
     }
     os.put('"');
 }
+
+static constexpr size_t POST9_FIELDS_BYTES =
+    sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t);
+static_assert(POST9_FIELDS_BYTES <= (size_t)POSTING9_V2_BYTES, "POSTING9_V2_BYTES too small");
+static constexpr size_t POST9_PAD_BYTES =
+    (size_t)POSTING9_V2_BYTES - POST9_FIELDS_BYTES;
+
 
 static constexpr std::streamoff DOCMETA_BYTES = (std::streamoff)DOCMETA_V2_BYTES;
 
@@ -105,6 +113,11 @@ struct PostingStream {
         in.read(reinterpret_cast<char*>(&p.did), sizeof(p.did));
         in.read(reinterpret_cast<char*>(&p.pos), sizeof(p.pos));
         if (!in) throw L5Exception("read posting failed");
+
+        if constexpr (POST9_PAD_BYTES > 0) {
+            in.ignore((std::streamsize)POST9_PAD_BYTES);
+            if (!in) throw L5Exception("read posting padding failed");
+        }
 
         p.did += did_offset;
 
@@ -170,18 +183,21 @@ static void copy_docmeta_bytes(const fs::path& seg_dir, uint32_t n_docs, std::of
 
 static void write_docids_merged(const fs::path& out_path,
                                 const std::string& new_meta_path,
-                                const std::vector<fs::path>& src_seg_dirs) {
+                                const std::vector<SegInfo>& infos) {
     std::ofstream dj(out_path, std::ios::binary);
     if (!dj) throw L5Exception("cannot open docids tmp: " + out_path.string());
 
     dj.put('[');
     bool first = true;
 
-    for (const auto& seg : src_seg_dirs) {
+    for (const auto& si : infos) {
         std::vector<DocInfo> docs;
         std::string err;
-        if (!load_docids_json(seg, docs, &err)) {
+        if (!load_docids_json(si.seg_dir, docs, &err)) {
             throw L5Exception("load_docids_json failed: " + err);
+        }
+        if (docs.size() != (size_t)si.h.n_docs) {
+            throw L5Exception("docids size mismatch in " + si.seg_dir.string());
         }
 
         for (auto& di : docs) {
@@ -300,7 +316,17 @@ SegmentEntry merge_segments_sorted(const fs::path& dst_root,
 
     // write docids.tmp (meta_path rewritten)
     const std::string meta_path = new_segment_name + "/";
-    write_docids_merged(doc_tmp, meta_path, src_seg_dirs);
+    write_docids_merged(doc_tmp, meta_path, infos);
+
+    auto write_post9 = [](std::ofstream& out, const Posting9& p) {
+        out.write(reinterpret_cast<const char*>(&p.h), sizeof(p.h));
+        out.write(reinterpret_cast<const char*>(&p.did), sizeof(p.did));
+        out.write(reinterpret_cast<const char*>(&p.pos), sizeof(p.pos));
+        if constexpr (POST9_PAD_BYTES > 0) {
+            static const std::string pad(POST9_PAD_BYTES, '\0');
+            out.write(pad.data(), (std::streamsize)pad.size());
+        }
+    };
 
     // write meta.tmp
     {
@@ -362,9 +388,7 @@ SegmentEntry merge_segments_sorted(const fs::path& dst_root,
             buf.push_back(it.p);
             if (buf.size() >= (1u << 16)) {
                 for (const auto& p : buf) {
-                    out.write(reinterpret_cast<const char*>(&p.h), sizeof(p.h));
-                    out.write(reinterpret_cast<const char*>(&p.did), sizeof(p.did));
-                    out.write(reinterpret_cast<const char*>(&p.pos), sizeof(p.pos));
+                    write_post9(out, p);
                 }
                 if (!out) throw L5Exception("merge: postings write failed");
                 buf.clear();
@@ -377,9 +401,7 @@ SegmentEntry merge_segments_sorted(const fs::path& dst_root,
 
         if (!buf.empty()) {
             for (const auto& p : buf) {
-                out.write(reinterpret_cast<const char*>(&p.h), sizeof(p.h));
-                out.write(reinterpret_cast<const char*>(&p.did), sizeof(p.did));
-                out.write(reinterpret_cast<const char*>(&p.pos), sizeof(p.pos));
+                write_post9(out, p);
             }
             if (!out) throw L5Exception("merge: postings write failed");
         }

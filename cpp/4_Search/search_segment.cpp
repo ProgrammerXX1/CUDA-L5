@@ -5,11 +5,26 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace l5 {
+
+namespace {
+static inline bool search_trace_enabled() {
+    static int enabled = []() -> int {
+        const char* v = std::getenv("L5_SEARCH_TRACE");
+        if (!v || !*v) return 0;
+        if (v[0] == '0') return 0;
+        return 1;
+    }();
+    return enabled != 0;
+}
+} // namespace
 
 static inline std::pair<size_t, size_t> range_for_hash_safe(
     const std::vector<Posting9>& postings,
@@ -189,15 +204,25 @@ std::vector<Hit> search_in_segment(
     };
     std::vector<HashRange> q_ranges;
     q_ranges.reserve(q.items.size());
+    size_t skipped_stop_hash = 0;
     for (const auto& qi : q.items) {
         auto [l, r] = range_for_hash_safe(seg.postings9, qi.h);
         const uint64_t range_len = (uint64_t)(r - l);
         if (range_len == 0) continue;
-        if (range_len > (uint64_t)opt.max_postings_per_hash) continue; // stop-hash
+        if (range_len > (uint64_t)opt.max_postings_per_hash) { ++skipped_stop_hash; continue; } // stop-hash
         q_ranges.push_back(HashRange{&qi, l, r});
     }
     if (q_ranges.empty()) return out;
-
+    if (search_trace_enabled()) {
+        std::fprintf(stderr,
+            "[L5_SEARCH] seg_docs=%u q_items=%zu q_ranges=%zu stop_hash_skipped=%zu max_post/hash=%u\n",
+            (unsigned)n_docs_safe,
+            q.items.size(),
+            q_ranges.size(),
+            skipped_stop_hash,
+            (unsigned)opt.max_postings_per_hash
+        );
+    }
     // -------------------------
     // Stage A: hits per doc
     // -------------------------
@@ -265,14 +290,18 @@ std::vector<Hit> search_in_segment(
     }
 
     out.reserve(cand.size());
+    size_t cand_with_pts = 0;
+    size_t cand_with_spans = 0;
 
     for (uint32_t idx = 0; idx < (uint32_t)cand.size(); ++idx) {
         const uint32_t did = cand[idx];
         auto& pts = points_by_cand[idx];
         if (pts.empty()) continue;
+        ++cand_with_pts;
 
         auto spans = build_spans_for_doc(pts, opt);
         if (spans.empty()) continue;
+        ++cand_with_spans;
 
         const uint32_t matched_q = union_len_inclusive_from_spans(spans, /*query_side=*/true);
         const uint32_t matched_d = union_len_inclusive_from_spans(spans, /*query_side=*/false);
@@ -322,6 +351,32 @@ std::vector<Hit> search_in_segment(
         }
 
         out.push_back(std::move(h));
+    }
+
+    if (search_trace_enabled()) {
+        std::fprintf(stderr,
+            "[L5_SEARCH] cand=%zu cand_pts=%zu cand_spans=%zu out=%zu\n",
+            cand.size(), cand_with_pts, cand_with_spans, out.size()
+        );
+        // Если A нашёл кандидатов, но B всех выкинул — почти всегда проблема в pos-единицах (байты vs индексы токенов)
+        if (!cand.empty() && cand_with_pts > 0 && out.empty()) {
+            const uint32_t did0 = cand[0];
+            const auto& pts0 = points_by_cand[0];
+            uint32_t qmin = std::numeric_limits<uint32_t>::max(), qmax = 0;
+            uint32_t dmin = std::numeric_limits<uint32_t>::max(), dmax = 0;
+            for (size_t i = 0; i < pts0.size(); ++i) {
+                qmin = std::min(qmin, pts0[i].qpos); qmax = std::max(qmax, pts0[i].qpos);
+                dmin = std::min(dmin, pts0[i].dpos); dmax = std::max(dmax, pts0[i].dpos);
+            }
+            std::fprintf(stderr,
+                "[L5_SEARCH] SUSPECT: no spans. did=%u tok_len=%u pts=%zu qpos[%u..%u] dpos[%u..%u]\n",
+                (unsigned)did0,
+                (unsigned)seg.docmeta[did0].tok_len,
+                pts0.size(),
+                (unsigned)qmin, (unsigned)qmax,
+                (unsigned)dmin, (unsigned)dmax
+            );
+        }
     }
 
     std::sort(out.begin(), out.end(), [](const Hit& a, const Hit& b) {

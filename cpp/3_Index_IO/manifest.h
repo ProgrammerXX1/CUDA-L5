@@ -38,5 +38,9 @@ bool save_manifest(const std::filesystem::path& out_root, const Manifest& m);
 // NEW: remove a set of segments and rewrite manifest atomically
 bool remove_segments_from_manifest(const std::filesystem::path& out_root,
                                    const std::vector<std::string>& segment_names);
-
+// Atomic manifest update: remove a set of segments and append one new segment in a single locked commit.
+bool replace_segments_in_manifest(const std::filesystem::path& out_root,
+                                 const std::vector<std::string>& remove_segment_names,
+                                 const SegmentEntry& add_entry,
+                                 std::string* err = nullptr);
 } // namespace l5

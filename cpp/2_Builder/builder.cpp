@@ -102,6 +102,18 @@ static bool segment_name_is_safe(const std::string& s) {
     return true;
 }
 
+static inline void trim_trailing_cr(std::string& s) {
+    if (!s.empty() && s.back() == '\r') s.pop_back();
+}
+
+static inline void strip_utf8_bom(std::string& s) {
+    if (s.size() >= 3 &&
+        (unsigned char)s[0] == 0xEF &&
+        (unsigned char)s[1] == 0xBB &&
+        (unsigned char)s[2] == 0xBF) {
+        s.erase(0, 3);
+    }
+}
 
 static bool has_key(const simdjson::dom::element& e, const char* key) {
     simdjson::dom::element tmp;
@@ -121,11 +133,12 @@ static bool get_text_is_normalized(const simdjson::dom::element& doc, bool stric
     const bool has_new = has_key(doc, "text_is_normalized");
     const bool has_old = has_key(doc, "normalized");
 
-    if (has_new) return get_bool_safe(doc, "text_is_normalized", true);
-    if (has_old) return get_bool_safe(doc, "normalized", true);
+    if (has_new) return get_bool_safe(doc, "text_is_normalized", false);
+    if (has_old) return get_bool_safe(doc, "normalized", false);
 
-    if (strict) return false;
-    return true;
+    // safest default: assume raw text (needs normalization)
+    (void)strict;
+    return false;
 }
 
 static std::string_view get_sv_or_empty(const simdjson::dom::element& doc, const char* key) {
@@ -280,6 +293,11 @@ struct RunReader {
     bool has{false};
 
     explicit RunReader(const fs::path& p) {
+        std::error_code ec_sz;
+        const uint64_t bytes = fs::exists(p, ec_sz) ? (uint64_t)fs::file_size(p, ec_sz) : 0;
+        if (ec_sz) throw L5Exception("cannot stat run: " + p.string());
+        if (bytes % (uint64_t)sizeof(P9) != 0) throw L5Exception("run not aligned: " + p.string());
+
         in.open(p, std::ios::binary);
         if (!in) throw L5Exception("cannot open run: " + p.string());
         next();
@@ -392,8 +410,9 @@ static bool acquire_did_window(std::atomic<uint32_t>& next_did,
 
         if (max_docs != 0 && cur >= max_docs) return false;
 
-        // if window has room => try allocate did
-        if ((cur - committed) < window) {
+        // if window has room => try allocate did (avoid uint32 wrap)
+        const uint64_t outstanding = (cur >= committed) ? (uint64_t)(cur - committed) : 0ull;
+        if (outstanding < (uint64_t)window) {
             if (next_did.compare_exchange_weak(cur, cur + 1, std::memory_order_relaxed)) {
                 out_did = cur;
                 return true;
@@ -408,7 +427,8 @@ static bool acquire_did_window(std::atomic<uint32_t>& next_did,
             const uint32_t c = gate.committed.load(std::memory_order_acquire);
             const uint32_t n = next_did.load(std::memory_order_relaxed);
             if (max_docs != 0 && n >= max_docs) return true;
-            return (n - c) < window;
+            const uint64_t out2 = (n >= c) ? (uint64_t)(n - c) : 0ull;
+            return out2 < (uint64_t)window;
         });
     }
 }
@@ -437,6 +457,20 @@ static void partition_postings_to_buckets(const std::vector<fs::path>& inputs,
     std::vector<P9> block;
     block.reserve(BLOCK_RECS);
 
+    // sanity: inputs must be aligned to P9
+    uint64_t expected_total_recs = 0;
+    for (const auto& in_path : inputs) {
+        std::error_code ec_sz;
+        if (!fs::exists(in_path, ec_sz) || ec_sz) continue;
+        const uint64_t bytes = (uint64_t)fs::file_size(in_path, ec_sz);
+        if (ec_sz) throw L5Exception("cannot stat postings tmp: " + in_path.string());
+        if (bytes % (uint64_t)sizeof(P9) != 0) {
+            throw L5Exception("postings tmp not aligned: " + in_path.string());
+        }
+        expected_total_recs += bytes / (uint64_t)sizeof(P9);
+    }
+    uint64_t seen_total_recs = 0;
+
     for (const auto& in_path : inputs) {
         std::ifstream in(in_path, std::ios::binary);
         if (!in) {
@@ -446,7 +480,7 @@ static void partition_postings_to_buckets(const std::vector<fs::path>& inputs,
         while (true) {
             const size_t got = read_p9_chunk(in, block, BLOCK_RECS);
             if (got == 0) break;
-
+            seen_total_recs += (uint64_t)got;
             for (size_t i = 0; i < got; ++i) {
                 const P9& p = block[i];
                 const unsigned b = (unsigned)((p.h >> 56) & 0xFF);
@@ -462,6 +496,11 @@ static void partition_postings_to_buckets(const std::vector<fs::path>& inputs,
         in.close();
         std::error_code ec;
         fs::remove(in_path, ec); // cleanup worker file
+    }
+
+    if (seen_total_recs != expected_total_recs) {
+        throw L5Exception("postings tmp read mismatch: got=" + std::to_string(seen_total_recs) +
+                          " expect=" + std::to_string(expected_total_recs));
     }
 
     for (size_t b = 0; b < BUCKETS; ++b) {
@@ -484,6 +523,10 @@ static void sort_bucket_append_to_index(const fs::path& bucket_path,
     std::error_code ec;
     const uint64_t bytes = fs::exists(bucket_path, ec) ? (uint64_t)fs::file_size(bucket_path, ec) : 0;
     if (ec || bytes == 0) return;
+
+    if (bytes % (uint64_t)sizeof(P9) != 0) {
+        throw L5Exception("bucket not aligned: " + bucket_path.string());
+    }
 
     const uint64_t total_recs = bytes / (uint64_t)sizeof(P9);
     if (total_recs == 0) return;
@@ -526,10 +569,11 @@ static void sort_bucket_append_to_index(const fs::path& bucket_path,
     a.reserve(chunk_recs);
 
     size_t run_idx = 0;
+    uint64_t read_recs = 0;
     while (true) {
         const size_t got = read_p9_chunk(in, a, chunk_recs);
         if (got == 0) break;
-
+        read_recs += (uint64_t)got;
         radix_sort_p9(a, tmp);
 
         char rn[64];
@@ -544,8 +588,12 @@ static void sort_bucket_append_to_index(const fs::path& bucket_path,
 
         runs.push_back(run_path);
     }
-
     in.close();
+    if (read_recs != total_recs) {
+        throw L5Exception("bucket read mismatch: got=" + std::to_string(read_recs) +
+                          " expect=" + std::to_string(total_recs) +
+                          " path=" + bucket_path.string());
+    }
     {
         std::error_code ec2;
         fs::remove(bucket_path, ec2);
@@ -614,9 +662,6 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
     if (opt.max_tokens_per_doc > kHardMaxTokens) opt.max_tokens_per_doc = kHardMaxTokens;
 
     std::string segment_name = opt.segment_name;
-    if (segment_name.empty()) {
-        segment_name = std::string("seg_") + utc_now_compact();
-    }
     if (segment_name.empty()) {
         segment_name = std::string("seg_") + utc_now_compact();
     }
@@ -737,7 +782,8 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
             while (q_docs.pop(r)) {
                 if (r.did < expect) {
                     // shouldn't happen; ignore
-                    continue;
+                    throw L5Exception("writer got did<expect: did=" + std::to_string(r.did) +
+                                      " expect=" + std::to_string(expect));
                 }
                 const uint32_t delta = r.did - expect;
                 if (delta >= window) {
@@ -810,6 +856,13 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
                     ++expect;
                     did_gate.committed.store(expect, std::memory_order_release);
                     did_gate.cv.notify_all();
+                }
+            }
+            {
+                const uint32_t allocated = next_did.load(std::memory_order_acquire);
+                if (allocated != expect) {
+                    throw L5Exception("did gap: allocated=" + std::to_string(allocated) +
+                                      " committed=" + std::to_string(expect));
                 }
             }
 
@@ -907,6 +960,7 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
                     }
 
                     // hashes + simhash
+                    token_hashes.clear();
                     hash_tokens_bytes_spans(norm, spans, token_hashes);
                     auto [hi, lo] = simhash128_token_hashes(token_hashes);
 
@@ -984,6 +1038,8 @@ BuildStats build_segment_jsonl(const fs::path& corpus_jsonl,
                 if (stop.load(std::memory_order_relaxed)) break;
                 if (line.empty()) continue;
 
+                trim_trailing_cr(line);
+                strip_utf8_bom(line);
                 if (line.size() > max_line) {
                     // деградация: пропускаем слишком длинную строку (не держим в очереди)
                     line.clear();
