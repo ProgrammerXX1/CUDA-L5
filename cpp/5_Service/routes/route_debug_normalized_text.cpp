@@ -30,14 +30,15 @@ void register_route_debug_normalized_text(httplib::Server& app, ServiceRouteCont
         else { reply_json(res, 400, {{"error","bad normalize param"}}); return; }
       }
 
-      size_t max_bytes = 1000;
+
+      const size_t HARD_CAP = 8ull * 1024 * 1024; // 8 MiB
+
+      size_t max_bytes = HARD_CAP;
       if (req.has_param("max_bytes")) {
         try { max_bytes = (size_t)std::stoull(req.get_param_value("max_bytes")); }
         catch (...) { reply_json(res, 400, {{"error","bad max_bytes"}}); return; }
+        if (max_bytes == 0 || max_bytes > HARD_CAP) max_bytes = HARD_CAP;
       }
-      const size_t HARD_CAP = 8ull * 1024 * 1024; // 8 MiB
-      if (max_bytes == 0 || max_bytes > HARD_CAP) max_bytes = HARD_CAP;
-
       const fs::path uploads_dir = ctx.data_root / "orgs" / org_id / "uploads";
       const fs::path src_path = uploads_dir / name;
 
