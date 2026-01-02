@@ -47,7 +47,11 @@ CompactResult compact_once(const fs::path& src_root,
 
     if (opt.fanout < 2) return rr;
 
-    Manifest m = load_manifest(src_root);
+    Manifest m;
+    std::string merr;
+    if (!load_manifest_strict(src_root, m, &merr)) {
+        throw L5Exception("compact: manifest corrupted: " + merr);
+    }
     if (m.segments.size() < (size_t)opt.fanout) return rr;
 
     const unsigned N = opt.fanout;
@@ -82,7 +86,11 @@ CompactResult compact_once(const fs::path& src_root,
 
     // 2) update manifests atomically
     if (fs::equivalent(src_root, out_root, ec) && !ec) {
-        Manifest mm = load_manifest(src_root);
+        Manifest mm;
+        std::string merr2;
+        if (!load_manifest_strict(src_root, mm, &merr2)) {
+            throw L5Exception("compact: manifest corrupted (same root): " + merr2);
+        }
 
         // filter out old
         Manifest keep;

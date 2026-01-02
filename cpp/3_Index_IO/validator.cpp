@@ -7,6 +7,7 @@
 
 #include <filesystem>
 #include <sstream>
+#include <string>
 
 namespace l5 {
 
@@ -72,7 +73,13 @@ ValidationResult validate_segment(const std::filesystem::path& seg_dir, bool che
 
 ValidationResult validate_out_root(const std::filesystem::path& out_root) {
     ValidationResult vr;
-    auto m = load_manifest(out_root);
+    Manifest m;
+    std::string merr;
+    if (!load_manifest_strict(out_root, m, &merr)) {
+        vr.errors.push_back("manifest corrupted: " + merr);
+        vr.ok = false;
+        return vr;
+    }
     if (m.segments.empty()) {
         vr.errors.push_back("manifest has no segments (or missing)");
         vr.ok = false;

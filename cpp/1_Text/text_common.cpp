@@ -2,14 +2,23 @@
 #include "text_common.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cassert>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
 
 
 namespace {
+
+// Keep these in sync with extractor.cpp hard limits (bounded memory).
+static constexpr size_t kHardMaxTextBytes            = 256ull * 1024 * 1024; // 256 MiB
+static constexpr size_t kNormalizeReserveCapBytes    = 64ull  * 1024 * 1024; // avoid huge upfront reserve
+static constexpr size_t kHardMaxTokenSpans           = 50ull * 1000 * 1000;  // guard vs token-vector OOM
+
 
 static inline bool text_trace_enabled() {
     static int enabled = []() -> int {
@@ -205,9 +214,25 @@ static inline uint32_t to_lower_ru_kz(uint32_t cp) {
 
 } // namespace
 
+static inline bool is_ascii_apostrophe(unsigned char c) {
+    // '  (U+0027)
+    return c == '\'';
+}
+
+static inline bool is_apostrophe_like(uint32_t cp) {
+    // ' ’ ʻ ʼ  (common apostrophes)
+    return cp == 0x0027  // '
+        || cp == 0x2019  // ’
+        || cp == 0x2018  // ‘
+        || cp == 0x02BC  // ʼ
+        || cp == 0x02BB; // ʻ
+}
 void normalize_for_shingles_simple_to(std::string_view s, std::string& out) {
     out.clear();
-    out.reserve(s.size());
+    if (s.size() > kHardMaxTextBytes) {
+        throw std::runtime_error("normalize input too large: " + std::to_string((unsigned long long)s.size()));
+    }
+    out.reserve(std::min(s.size(), kNormalizeReserveCapBytes));
 
     bool prev_space = true;
 
@@ -218,6 +243,10 @@ void normalize_for_shingles_simple_to(std::string_view s, std::string& out) {
         if (b < 0x80) {
             unsigned char c = (unsigned char)s[i];
             if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+            if (is_ascii_apostrophe(c)) {
+                ++i;
+                continue;
+            }
 
             if (is_ascii_alnum_lower(c)) {
                 out.push_back((char)c);
@@ -250,7 +279,11 @@ void normalize_for_shingles_simple_to(std::string_view s, std::string& out) {
 
         uint32_t cp = to_lower_ru_kz(d.cp);
         cp = arabic_digit_to_ascii(cp);
-
+        // Apostrophes: eat (do not separate tokens)
+        if (is_apostrophe_like(cp)) {
+            i += d.len;
+            continue;
+        }
         // Arabic diacritics/tatweel: ignore (do not break tokens with spaces)
         if (is_arabic_diacritic_or_tatweel(cp)) {
             i += d.len;
@@ -295,6 +328,9 @@ std::string normalize_for_shingles_simple(std::string_view s) {
 
 void tokenize_spans(const std::string& s, std::vector<TokenSpan>& out) {
     out.clear();
+    if (s.size() > kHardMaxTextBytes) {
+        throw std::runtime_error("tokenize input too large: " + std::to_string((unsigned long long)s.size()));
+    }
     const size_t n = s.size();
     size_t i = 0;
 
@@ -368,6 +404,10 @@ void tokenize_spans(const std::string& s, std::vector<TokenSpan>& out) {
             if (start > (size_t)u32max || len > (size_t)u32max) {
                 throw std::runtime_error("token span overflow (string too large)");
             }
+            if (out.size() >= kHardMaxTokenSpans) {
+                throw std::runtime_error("too many tokens (hard cap): " +
+                                         std::to_string((unsigned long long)out.size()));
+            }
             TokenSpan ts;
             ts.start = (uint32_t)start;
             ts.len = (uint32_t)len;
@@ -414,15 +454,15 @@ uint64_t hash_shingle_tokens_spans(const std::string& s,
                                   const std::vector<TokenSpan>& spans,
                                   int pos,
                                   int K) {
-    assert(pos >= 0);
-    assert(K > 0);
-    assert((size_t)pos <= spans.size());
-    assert((size_t)(pos + K) <= spans.size());
+
     validate_shingle_args(spans.size(), pos, K);
+    const size_t upos = (size_t)pos;
+    const size_t end  = upos + (size_t)K;
+
     uint64_t h = 0x9E3779B97F4A7C15ULL;
-    const int end = pos + K;
-    for (int i = pos; i < end; ++i) {
-        uint64_t th = hash_token_bytes_internal(s, spans[(size_t)i]);
+
+    for (size_t i = upos; i < end; ++i) {
+        uint64_t th = hash_token_bytes_internal(s, spans[i]);
         h ^= th + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
     }
     return h;
@@ -430,6 +470,10 @@ uint64_t hash_shingle_tokens_spans(const std::string& s,
 
 std::pair<uint64_t, uint64_t> simhash128_spans(const std::string& s,
                                                const std::vector<TokenSpan>& spans) {
+    if (spans.size() > kHardMaxTokenSpans) {
+        throw std::runtime_error("too many tokens for simhash (hard cap): " +
+                                 std::to_string((unsigned long long)spans.size()));
+    }
     int v0[64] = {0};
     int v1[64] = {0};
 
@@ -452,6 +496,10 @@ std::pair<uint64_t, uint64_t> simhash128_spans(const std::string& s,
 void hash_tokens_bytes_spans(const std::string& s,
                              const std::vector<TokenSpan>& spans,
                              std::vector<uint64_t>& out_hashes) {
+    if (spans.size() > kHardMaxTokenSpans) {
+        throw std::runtime_error("too many tokens for hashing (hard cap): " +
+                                 std::to_string((unsigned long long)spans.size()));
+    }
     out_hashes.resize(spans.size());
     for (size_t i = 0; i < spans.size(); ++i) {
         out_hashes[i] = hash_token_bytes_internal(s, spans[i]);
@@ -461,21 +509,23 @@ void hash_tokens_bytes_spans(const std::string& s,
 uint64_t hash_shingle_token_hashes(const std::vector<uint64_t>& token_hashes,
                                    int pos,
                                    int K) {
-    assert(pos >= 0);
-    assert(K > 0);
-    assert((size_t)pos <= token_hashes.size());
-    assert((size_t)(pos + K) <= token_hashes.size());
+
     validate_shingle_args(token_hashes.size(), pos, K);
+    const size_t upos = (size_t)pos;
+    const size_t end  = upos + (size_t)K;
     uint64_t h = 0x9E3779B97F4A7C15ULL;
-    const int end = pos + K;
-    for (int i = pos; i < end; ++i) {
-        const uint64_t th = token_hashes[(size_t)i];
+    for (size_t i = upos; i < end; ++i) {
+        const uint64_t th = token_hashes[i];
         h ^= th + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
     }
     return h;
 }
 
 std::pair<uint64_t, uint64_t> simhash128_token_hashes(const std::vector<uint64_t>& token_hashes) {
+    if (token_hashes.size() > kHardMaxTokenSpans) {
+        throw std::runtime_error("too many token hashes for simhash (hard cap): " +
+                                 std::to_string((unsigned long long)token_hashes.size()));
+    }
     int v0[64] = {0};
     int v1[64] = {0};
 

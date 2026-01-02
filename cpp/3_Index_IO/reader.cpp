@@ -2,6 +2,7 @@
 #include "l5/reader.h"
 
 #include <fstream>
+#include <filesystem>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -13,6 +14,12 @@ bool load_segment_bin(const std::filesystem::path& seg_dir, SegmentData& out, st
     out.seg_dir = seg_dir;
 
     const auto bin = seg_dir / "index_native.bin";
+    std::error_code ec;
+    const uint64_t file_bytes = std::filesystem::file_size(bin, ec);
+    if (ec) {
+        if (err) *err = "file_size failed: " + ec.message();
+        return false;
+    }
     std::ifstream in(bin, std::ios::binary);
     if (!in) {
         if (err) *err = "cannot open " + bin.string();
@@ -22,6 +29,11 @@ bool load_segment_bin(const std::filesystem::path& seg_dir, SegmentData& out, st
     HeaderV2 h{};
     if (!read_header_v2(in, h)) {
         if (err) *err = "invalid header or version in " + bin.string();
+        return false;
+    }
+    std::string herr;
+    if (!header_v2_sane(h, file_bytes, &herr)) {
+        if (err) *err = "insane header: " + herr;
         return false;
     }
     out.header = h;

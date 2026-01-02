@@ -1,3 +1,4 @@
+// Back_L5/cpp/src/merge.cpp
 #include "l5/merge.h"
 
 #include "l5/errors.h"
@@ -9,11 +10,13 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <queue>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -46,8 +49,7 @@ static void json_write_string(std::ostream& os, std::string_view s) {
     os.put('"');
 }
 
-static constexpr std::streamoff HDR_BYTES = 4 + 4 + 4 + 8 + 8; // 28
-static constexpr std::streamoff DOCMETA_BYTES = 4 + 8 + 8;     // 20
+static constexpr std::streamoff DOCMETA_BYTES = (std::streamoff)DOCMETA_V2_BYTES;
 
 struct SegInfo {
     fs::path seg_dir;
@@ -66,15 +68,28 @@ struct PostingStream {
 
     PostingStream(const fs::path& seg_dir, uint32_t did_off) {
         const fs::path bin = seg_dir / "index_native.bin";
+
+        std::error_code ec;
+        const uint64_t file_bytes = fs::file_size(bin, ec);
+        if (ec) throw L5Exception("file_size failed " + bin.string() + " err=" + ec.message());
+
         in.open(bin, std::ios::binary);
         if (!in) throw L5Exception("cannot open " + bin.string());
 
         HeaderV2 h{};
         if (!read_header_v2(in, h)) throw L5Exception("invalid header " + bin.string());
 
-        // skip docmeta
-        const std::streamoff off = HDR_BYTES + (std::streamoff)h.n_docs * DOCMETA_BYTES;
-        in.seekg(off, std::ios::beg);
+        std::string herr;
+        if (!header_v2_sane(h, file_bytes, &herr)) {
+            throw L5Exception("insane header " + bin.string() + ": " + herr);
+        }
+
+        // after read_header_v2() stream is at docmeta start; skip docmeta relative to current pos
+        const uint64_t skip_u64 = (uint64_t)h.n_docs * (uint64_t)DOCMETA_V2_BYTES;
+        if (skip_u64 > (uint64_t)std::numeric_limits<std::streamoff>::max()) {
+            throw L5Exception("seek overflow (docmeta skip) " + bin.string());
+        }
+        in.seekg((std::streamoff)skip_u64, std::ios::cur);
         if (!in) throw L5Exception("seek failed " + bin.string());
 
         remaining = h.n_post9;
@@ -119,18 +134,26 @@ struct HeapCmp {
 
 static void copy_docmeta_bytes(const fs::path& seg_dir, uint32_t n_docs, std::ofstream& out) {
     const fs::path bin = seg_dir / "index_native.bin";
+
+    std::error_code ec;
+    const uint64_t file_bytes = fs::file_size(bin, ec);
+    if (ec) throw L5Exception("file_size failed " + bin.string() + " err=" + ec.message());
+
     std::ifstream in(bin, std::ios::binary);
     if (!in) throw L5Exception("cannot open " + bin.string());
 
     HeaderV2 h{};
     if (!read_header_v2(in, h)) throw L5Exception("invalid header " + bin.string());
+
+    std::string herr;
+    if (!header_v2_sane(h, file_bytes, &herr)) {
+        throw L5Exception("insane header " + bin.string() + ": " + herr);
+    }
+
     if (h.n_docs != n_docs) throw L5Exception("docmeta copy: n_docs mismatch");
 
-    const std::streamoff off = HDR_BYTES;
-    const uint64_t bytes = (uint64_t)n_docs * (uint64_t)DOCMETA_BYTES;
-
-    in.seekg(off, std::ios::beg);
-    if (!in) throw L5Exception("seek docmeta failed");
+    // After read_header_v2(), stream is at docmeta start.
+    const uint64_t bytes = (uint64_t)n_docs * (uint64_t)DOCMETA_V2_BYTES;
 
     std::vector<char> buf(1u << 20); // 1 MiB
     uint64_t left = bytes;
@@ -209,14 +232,16 @@ SegmentEntry merge_segments_sorted(const fs::path& dst_root,
 
     const fs::path seg_dir = dst_root / new_segment_name;
     if (fs::exists(seg_dir)) throw L5Exception("merge: segment exists: " + seg_dir.string());
+
     fs::create_directories(seg_dir, ec);
     if (ec) throw L5Exception("merge: cannot create seg dir: " + ec.message());
 
-    // temp files
+    // final files
     const fs::path bin_fin  = seg_dir / "index_native.bin";
     const fs::path doc_fin  = seg_dir / "index_native_docids.json";
     const fs::path meta_fin = seg_dir / "index_native_meta.json";
 
+    // temp files
     const fs::path bin_tmp  = seg_dir / "index_native.bin.tmp";
     const fs::path doc_tmp  = seg_dir / "index_native_docids.json.tmp";
     const fs::path meta_tmp = seg_dir / "index_native_meta.json.tmp";
@@ -230,18 +255,39 @@ SegmentEntry merge_segments_sorted(const fs::path& dst_root,
 
     for (const auto& sdir : src_seg_dirs) {
         const fs::path bin = sdir / "index_native.bin";
+
+        std::error_code ec_sz;
+        const uint64_t file_bytes = fs::file_size(bin, ec_sz);
+        if (ec_sz) throw L5Exception("merge: file_size failed " + bin.string() + " err=" + ec_sz.message());
+
         std::ifstream in(bin, std::ios::binary);
         if (!in) throw L5Exception("merge: cannot open " + bin.string());
 
         HeaderV2 h{};
         if (!read_header_v2(in, h)) throw L5Exception("merge: invalid header " + bin.string());
 
+        std::string herr;
+        if (!header_v2_sane(h, file_bytes, &herr)) {
+            throw L5Exception("merge: insane header " + bin.string() + ": " + herr);
+        }
+
+        // did_off is uint32 -> MUST NOT overflow
+        const uint64_t did_next = (uint64_t)did_off + (uint64_t)h.n_docs;
+        if (did_next > (uint64_t)std::numeric_limits<uint32_t>::max()) {
+            throw L5Exception("merge: total_docs overflow uint32");
+        }
+
+        // total_post9 is uint64 -> protect overflow
+        if (total_post9 > std::numeric_limits<uint64_t>::max() - h.n_post9) {
+            throw L5Exception("merge: total_post9 overflow uint64");
+        }
+
         SegInfo si;
         si.seg_dir = sdir;
         si.h = h;
         si.did_offset = did_off;
 
-        did_off += h.n_docs;
+        did_off = (uint32_t)did_next;
         total_post9 += h.n_post9;
 
         infos.push_back(std::move(si));
@@ -249,6 +295,8 @@ SegmentEntry merge_segments_sorted(const fs::path& dst_root,
 
     const uint32_t total_docs = did_off;
     if (total_docs == 0) throw L5Exception("merge: total_docs=0");
+
+    const std::string built_at = utc_now_compact();
 
     // write docids.tmp (meta_path rewritten)
     const std::string meta_path = new_segment_name + "/";
@@ -258,8 +306,6 @@ SegmentEntry merge_segments_sorted(const fs::path& dst_root,
     {
         std::ofstream m(meta_tmp, std::ios::binary);
         if (!m) throw L5Exception("cannot open meta tmp: " + meta_tmp.string());
-
-        const std::string built_at = utc_now_compact();
 
         m.put('{');
         m << "\"segment_name\":";
@@ -343,14 +389,14 @@ SegmentEntry merge_segments_sorted(const fs::path& dst_root,
     }
 
     // atomic replace final files
-    if (!atomic_replace_file_best_effort(bin_tmp, bin_fin)) throw L5Exception("merge: atomic replace failed (bin)");
-    if (!atomic_replace_file_best_effort(doc_tmp, doc_fin)) throw L5Exception("merge: atomic replace failed (docids)");
+    if (!atomic_replace_file_best_effort(bin_tmp, bin_fin))  throw L5Exception("merge: atomic replace failed (bin)");
+    if (!atomic_replace_file_best_effort(doc_tmp, doc_fin))  throw L5Exception("merge: atomic replace failed (docids)");
     if (!atomic_replace_file_best_effort(meta_tmp, meta_fin)) throw L5Exception("merge: atomic replace failed (meta)");
 
     SegmentEntry e;
     e.segment_name = new_segment_name;
     e.path = new_segment_name + "/";
-    e.built_at_utc = utc_now_compact();
+    e.built_at_utc = built_at;
     e.stats.docs = total_docs;
     e.stats.k9 = total_post9;
     e.stats.k13 = 0;

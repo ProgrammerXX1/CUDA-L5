@@ -38,5 +38,14 @@ std::string utc_now_compact();
 
 bool atomic_replace_file_best_effort(const std::filesystem::path& tmp,
                                      const std::filesystem::path& fin);
+// ---- format constants (v2) ----
+constexpr uint64_t HEADER_V2_BYTES    = 4 + 4 + 4 + 8 + 8; // 28
+constexpr uint64_t DOCMETA_V2_BYTES   = 4 + 8 + 8;         // 20
+constexpr uint64_t POSTING9_V2_BYTES  = 4 + 4 + 4;         // 12
+
+// sanity: checks header vs file size and overflow risks (prevents OOM on corrupted files)
+bool header_v2_sane(const HeaderV2& h, uint64_t file_bytes, std::string* err);
+
+
 
 } // namespace l5

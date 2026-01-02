@@ -49,7 +49,8 @@ SearchResult search_out_root(const std::filesystem::path& out_root,
     for (auto& kv : best) res.hits.push_back(std::move(kv.second));
 
     std::sort(res.hits.begin(), res.hits.end(), [](const Hit& a, const Hit& b) {
-        return a.C > b.C;
+        if (a.C != b.C) return a.C > b.C;
+        return a.doc_id < b.doc_id;
     });
     if (res.hits.size() > opt.topk) res.hits.resize(opt.topk);
 

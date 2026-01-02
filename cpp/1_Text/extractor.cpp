@@ -155,7 +155,18 @@ static std::string read_entire_file_limited(const fs::path& p) {
     }
 
     const size_t need = out.size() + (size_t)got;
-    if (out.capacity() < need) out.reserve(need); // avoid huge geometric over-alloc
+    if (out.capacity() < need) {
+      // Bounded geometric growth to avoid O(n^2) realloc when file_size() is unavailable.
+      size_t new_cap = out.capacity();
+      if (new_cap == 0) new_cap = chunk;
+      while (new_cap < need) {
+        size_t grown = new_cap + (new_cap >> 1); // 1.5x
+        if (grown <= new_cap) { new_cap = need; break; } // overflow guard
+        new_cap = grown;
+      }
+      if (new_cap > kHardMaxReadBytes) new_cap = (size_t)kHardMaxReadBytes;
+      out.reserve(new_cap);
+    }
     out.append(buf.data(), (size_t)got);
   }
 

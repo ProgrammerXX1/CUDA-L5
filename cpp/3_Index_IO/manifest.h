@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string>
 #include <vector>
 
 namespace l5 {
@@ -22,6 +23,9 @@ struct SegmentEntry {
 struct Manifest {
     std::vector<SegmentEntry> segments;
 };
+
+bool load_manifest_strict(const std::filesystem::path& out_root, Manifest& out, std::string* err);
+
 
 Manifest load_manifest(const std::filesystem::path& out_root);
 
