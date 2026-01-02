@@ -9,6 +9,7 @@
 #include "service.h"
 
 class JobQueue;
+class HotCache;
 
 struct ServiceRouteContext {
   std::filesystem::path data_root;
@@ -18,6 +19,7 @@ struct ServiceRouteContext {
   JobQueue* q{nullptr};          // async jobs (SQLite queue)
   std::string node_id;           // for locked_by
 
+  HotCache* hot{nullptr};        // hot cache (API-only)
   size_t max_json_body_bytes{0};
   size_t max_text_bytes{0};
   size_t max_query_bytes{0};

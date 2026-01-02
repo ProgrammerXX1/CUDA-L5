@@ -1,6 +1,7 @@
 // cpp/5_Service/routes/route_segment_docs.cpp
 #include "routes.h"
 #include "route_utils.h"
+#include "core/file_lock.h"
 
 #include <algorithm>
 #include <cctype>
@@ -309,9 +310,11 @@ void register_route_segment_docs(httplib::Server& app, ServiceRouteContext& ctx)
   app.Get(R"(/v1/segment_docs)", [&](const httplib::Request& req, httplib::Response& res) {
     try {
       // 1) org_id задан -> обычная логика
+      FileLock global_lock(ctx.data_root / ".global.lock", FileLock::Mode::Shared);
       if (req.has_param("org_id")) {
         const std::string org_id = req.get_param_value("org_id");
         if (!is_safe_org_id(org_id)) { reply_json(res, 400, {{"error","bad org_id"}}); return; }
+        FileLock org_lock(ctx.data_root / "orgs" / org_id / ".org.lock", FileLock::Mode::Shared);
         handle_for_one_org(org_id, req, res, ctx);
         return;
       }

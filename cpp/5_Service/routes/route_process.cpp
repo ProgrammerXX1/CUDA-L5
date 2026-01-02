@@ -1,6 +1,7 @@
 // Back_Last/cpp/5_Service/routes/route_process.cpp
 #include "routes.h"
 #include "route_utils.h"
+#include "core/file_lock.h"
 
 #include <algorithm>
 #include <cmath>
@@ -191,6 +192,9 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
         reply_json(res, 200, out);
         return;
       }
+
+      FileLock global_lock(ctx.data_root / ".global.lock", FileLock::Mode::Shared);
+      FileLock org_lock(ctx.data_root / "orgs" / org_id / ".org.lock", FileLock::Mode::Shared);
 
       if (text.size() > ctx.max_query_bytes) {
         json err;

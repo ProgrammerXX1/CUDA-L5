@@ -26,6 +26,8 @@
 
 #include "core/job_queue.h"
 #include "core/file_lock.h"
+#include "core/hot_cache.h"
+
 #include <nlohmann/json.hpp>
 
 #include "l5/manifest.h"
@@ -492,6 +494,7 @@ static int run_api(const fs::path& data_root) {
   L5Service svc{data_root};
   JobQueue q(queue_db_path(data_root).string());
   q.init();
+  HotCache hot;
 
   httplib::Server app;
 
@@ -505,6 +508,7 @@ static int run_api(const fs::path& data_root) {
   ctx.svc = &svc;
   ctx.admin_mu = &g_admin_mu;
   ctx.q = &q;
+  ctx.hot = &hot;
   ctx.node_id = make_node_id();
   ctx.max_json_body_bytes  = MAX_JSON_BODY_BYTES;
   ctx.max_text_bytes       = MAX_TEXT_BYTES;

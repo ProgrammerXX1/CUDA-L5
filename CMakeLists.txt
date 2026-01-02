@@ -164,6 +164,7 @@ if(L5_BUILD_SERVICE)
   cpp/5_Service/main.cpp
   
   cpp/5_Service/core/job_queue.cpp
+  cpp/5_Service/core/hot_cache.cpp
 
   cpp/5_Service/core/service_common.cpp
   cpp/5_Service/core/service_ingest.cpp
@@ -184,6 +185,7 @@ if(L5_BUILD_SERVICE)
   cpp/5_Service/routes/route_process.cpp
   cpp/5_Service/routes/route_admin_compact.cpp
   cpp/5_Service/routes/route_admin_wipe_all.cpp
+  cpp/5_Service/routes/route_admin_hot_cache.cpp
 )
 
   target_include_directories(l5_service PRIVATE

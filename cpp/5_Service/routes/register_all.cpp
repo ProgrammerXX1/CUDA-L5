@@ -10,6 +10,7 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx);
 void register_route_admin_compact(httplib::Server& app, ServiceRouteContext& ctx);
 void register_route_admin_wipe_all(httplib::Server& app, ServiceRouteContext& ctx);
 void register_route_jobs(httplib::Server& app, ServiceRouteContext& ctx);
+void register_route_admin_hot_cache(httplib::Server& app, ServiceRouteContext& ctx);
 
 void register_routes(httplib::Server& app, ServiceRouteContext& ctx) {
   register_route_ingest_zip(app, ctx);
@@ -21,4 +22,5 @@ void register_routes(httplib::Server& app, ServiceRouteContext& ctx) {
   register_route_admin_compact(app, ctx);
   register_route_admin_wipe_all(app, ctx);
   register_route_jobs(app, ctx);
+  register_route_admin_hot_cache(app, ctx);
 }
