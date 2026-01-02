@@ -163,6 +163,8 @@ if(L5_BUILD_SERVICE)
   add_executable(l5_service
   cpp/5_Service/main.cpp
   
+  cpp/5_Service/core/job_queue.cpp
+
   cpp/5_Service/core/service_common.cpp
   cpp/5_Service/core/service_ingest.cpp
   cpp/5_Service/core/service_search.cpp
@@ -173,6 +175,7 @@ if(L5_BUILD_SERVICE)
 
   cpp/5_Service/routes/register_all.cpp
   cpp/5_Service/routes/route_utils.cpp
+  cpp/5_Service/routes/route_jobs.cpp
   cpp/5_Service/routes/route_ingest_zip.cpp
   cpp/5_Service/routes/route_debug_normalized_text.cpp
   cpp/5_Service/routes/route_rebuild_one.cpp
@@ -186,11 +189,13 @@ if(L5_BUILD_SERVICE)
   target_include_directories(l5_service PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/5_Service
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/5_Service/routes
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/5_Service/core
 )
 
   target_link_libraries(l5_service PRIVATE
     l5_engine
     cpp_httplib
+    Threads::Threads
   )
 
   target_include_directories(l5_service PRIVATE ${LIBZIP_INCLUDE_DIRS})

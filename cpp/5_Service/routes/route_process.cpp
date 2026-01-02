@@ -4,11 +4,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <unordered_map>
 #include <vector>
 
 #include "l5/result.h"
+#include "core/job_queue.h"
 
 namespace {
 
@@ -147,20 +149,45 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
         return;
       }
 
-      std::optional<IndexTextResult> indexed;
+      std::optional<int64_t> index_job_id;
       if (do_index) {
-        indexed = ctx.svc->index_text_document(org_id, document_id, file_name, title, author, created_at, text);
-        (void)ctx.svc->compact_small_levels(org_id, SMALL_FANOUT);
+        if (!ctx.q) { reply_json(res, 500, {{"error","job queue not configured"}}); return; }
+
+        // enqueue INDEX_TEXT job and persist text to org/jobs/job_<id>/input.txt
+        json payload = {
+          {"org_id", org_id},
+          {"document_id", document_id},
+          {"file_name", file_name},
+          {"title", title},
+          {"author", author},
+          {"created_at", created_at},
+          {"do_compact_small", 1},
+          {"small_fanout", (uint64_t)SMALL_FANOUT}
+        };
+
+        const int64_t job_id = ctx.q->enqueue("INDEX_TEXT", payload.dump(), /*priority*/5);
+        const fs::path job_dir = ctx.data_root / "orgs" / org_id / "jobs" / ("job_" + std::to_string(job_id));
+        ensure_dirs(job_dir);
+        const fs::path txt_path = job_dir / "input.txt";
+        {
+          std::ofstream out(txt_path, std::ios::binary);
+          if (!out) { reply_json(res, 500, {{"error","cannot write input text"}, {"path", txt_path.string()}}); return; }
+          out.write(text.data(), (std::streamsize)text.size());
+          out.flush();
+          if (!out) { reply_json(res, 500, {{"error","write input text failed"}, {"path", txt_path.string()}}); return; }
+        }
+        payload["text_path"] = (fs::path("orgs") / org_id / "jobs" / ("job_" + std::to_string(job_id)) / "input.txt").generic_string();
+        (void)ctx.q->update_payload(job_id, payload.dump());
+        index_job_id = job_id;
       }
 
       if (!do_search) {
         json out;
         out["document_id"] = document_id;
-        out["status"] = "indexed";
+        out["status"] = do_index ? "queued" : "noop";
         out["processed_at"] = L5Service::utc_now_iso_utc();
         out["indexed"] = do_index ? 1 : 0;
-        out["indexed_internal_id"] = indexed.has_value() ? json(std::to_string(indexed->doc.id)) : json(nullptr);
-        out["last_segment"] = indexed.has_value() ? json(indexed->doc.last_segment) : json(nullptr);
+        out["index_job_id"] = index_job_id.has_value() ? json(std::to_string(*index_job_id)) : json(nullptr);
         reply_json(res, 200, out);
         return;
       }
@@ -321,6 +348,8 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
       out["document_id"] = document_id;
       out["status"] = "completed";
       out["processed_at"] = L5Service::utc_now_iso_utc();
+      out["indexed_async"] = do_index ? 1 : 0;
+      out["index_job_id"] = index_job_id.has_value() ? json(std::to_string(*index_job_id)) : json(nullptr);
       out["plagiarism_percentage"] = plagiarism;
       out["selfcite_percentage"] = 0;
       out["legal_percentage"] = 0;
