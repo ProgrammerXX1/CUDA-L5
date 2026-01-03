@@ -31,6 +31,10 @@ public:
   // Upsert by (org_id, source_id). Returns internal id.
   int64_t upsert_doc_get_id(DocRow& d);
 
+  // Bulk upsert in a single transaction (much faster for 10k+ docs).
+  // Updates docs[i].id and returns ids in the same order.
+  std::vector<int64_t> upsert_docs_get_ids_bulk(std::vector<DocRow>& docs);
+
   std::optional<DocRow> get_by_source_id(const std::string& org_id, const std::string& source_id);
   std::optional<DocRow> get_by_internal_id(const std::string& org_id, int64_t id);
 

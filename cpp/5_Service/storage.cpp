@@ -220,6 +220,112 @@ int64_t Storage::upsert_doc_get_id(DocRow& d) {
   }
 }
 
+std::vector<int64_t> Storage::upsert_docs_get_ids_bulk(std::vector<DocRow>& docs) {
+  std::vector<int64_t> ids;
+  ids.reserve(docs.size());
+  if (docs.empty()) return ids;
+
+  auto* db = (sqlite3*)db_;
+  sqlite3_busy_timeout(db, 5000);
+
+  sqlite3_stmt* st_sel = nullptr;
+  sqlite3_stmt* st_upd = nullptr;
+  sqlite3_stmt* st_ins = nullptr;
+
+  const char* sql_sel = R"SQL(
+    SELECT id FROM documents WHERE org_id=? AND source_id=? LIMIT 1;
+  )SQL";
+
+  const char* sql_upd = R"SQL(
+    UPDATE documents
+    SET file_name=?,
+        title=?,
+        author=?,
+        created_at=?,
+        stored_at_utc=?,
+        deleted=?,
+        deleted_at_utc=?,
+        last_segment=?
+    WHERE id=?;
+  )SQL";
+
+  const char* sql_ins = R"SQL(
+    INSERT INTO documents(org_id, source_id, file_name, title, author, created_at, stored_at_utc, deleted, deleted_at_utc, last_segment)
+    VALUES(?,?,?,?,?,?,?,?,?,?);
+  )SQL";
+
+  exec(db, "BEGIN IMMEDIATE;");
+  try {
+    if (sqlite3_prepare_v2(db, sql_sel, -1, &st_sel, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed (bulk sel)");
+    if (sqlite3_prepare_v2(db, sql_upd, -1, &st_upd, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed (bulk upd)");
+    if (sqlite3_prepare_v2(db, sql_ins, -1, &st_ins, nullptr) != SQLITE_OK) throw std::runtime_error("sqlite prepare failed (bulk ins)");
+
+    for (auto& d : docs) {
+      int64_t id = 0;
+
+      // select id
+      sqlite3_reset(st_sel);
+      sqlite3_clear_bindings(st_sel);
+      sqlite3_bind_text(st_sel, 1, d.org_id.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st_sel, 2, d.source_id.c_str(), -1, SQLITE_TRANSIENT);
+      if (sqlite3_step(st_sel) == SQLITE_ROW) {
+        id = sqlite3_column_int64(st_sel, 0);
+      }
+
+      if (id > 0) {
+        // update
+        d.id = id;
+        sqlite3_reset(st_upd);
+        sqlite3_clear_bindings(st_upd);
+        sqlite3_bind_text(st_upd, 1, d.file_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st_upd, 2, d.title.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st_upd, 3, d.author.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st_upd, 4, d.created_at.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st_upd, 5, d.stored_at_utc.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int (st_upd, 6, d.deleted);
+        sqlite3_bind_text(st_upd, 7, d.deleted_at_utc.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st_upd, 8, d.last_segment.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st_upd, 9, d.id);
+        if (sqlite3_step(st_upd) != SQLITE_DONE) throw std::runtime_error("sqlite step failed (bulk upd)");
+        ids.push_back(d.id);
+        continue;
+      }
+
+      // insert
+      sqlite3_reset(st_ins);
+      sqlite3_clear_bindings(st_ins);
+      sqlite3_bind_text(st_ins, 1, d.org_id.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st_ins, 2, d.source_id.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st_ins, 3, d.file_name.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st_ins, 4, d.title.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st_ins, 5, d.author.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st_ins, 6, d.created_at.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st_ins, 7, d.stored_at_utc.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_int (st_ins, 8, d.deleted);
+      sqlite3_bind_text(st_ins, 9, d.deleted_at_utc.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st_ins,10, d.last_segment.c_str(), -1, SQLITE_TRANSIENT);
+
+      if (sqlite3_step(st_ins) != SQLITE_DONE) throw std::runtime_error("sqlite step failed (bulk ins)");
+      d.id = sqlite3_last_insert_rowid(db);
+      ids.push_back(d.id);
+    }
+
+    if (st_sel) sqlite3_finalize(st_sel);
+    if (st_upd) sqlite3_finalize(st_upd);
+    if (st_ins) sqlite3_finalize(st_ins);
+    st_sel = st_upd = st_ins = nullptr;
+
+    exec(db, "COMMIT;");
+    return ids;
+  } catch (...) {
+    if (st_sel) sqlite3_finalize(st_sel);
+    if (st_upd) sqlite3_finalize(st_upd);
+    if (st_ins) sqlite3_finalize(st_ins);
+    try { exec(db, "ROLLBACK;"); } catch (...) {}
+    throw;
+  }
+}
+
 std::vector<DocRow> Storage::get_by_internal_ids(const std::string& org_id, const std::vector<int64_t>& ids) {
   std::vector<DocRow> out;
   if (ids.empty()) return out;

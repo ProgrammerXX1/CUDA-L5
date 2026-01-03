@@ -119,6 +119,7 @@ add_library(l5_engine
   cpp/4_Search/result.cpp
   cpp/4_Search/search_segment.cpp
   cpp/4_Search/search_multi.cpp
+  cpp/4_Search/segobj_cache.cpp
 )
 
 target_include_directories(l5_engine
@@ -186,6 +187,7 @@ if(L5_BUILD_SERVICE)
   cpp/5_Service/routes/route_admin_compact.cpp
   cpp/5_Service/routes/route_admin_wipe_all.cpp
   cpp/5_Service/routes/route_admin_hot_cache.cpp
+  cpp/5_Service/routes/route_admin_ingest_fs_batch.cpp
 )
 
   target_include_directories(l5_service PRIVATE

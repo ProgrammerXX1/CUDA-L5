@@ -601,3 +601,180 @@ L5ZipIngestResult L5Service::ingest_l5_zip_build_segment(const std::string& org_
 
   return rr;
 }
+
+// -------------------- ingest_l5_fs_dirs_build_segment --------------------
+L5FsIngestResult L5Service::ingest_l5_fs_dirs_build_segment(const std::string& org_id,
+                                                            const std::string& dataset_root,
+                                                            const std::string& dataset_prefix,
+                                                            const std::vector<std::string>& src_dirs,
+                                                            unsigned shard,
+                                                            const std::string& segment_name,
+                                                            bool normalize,
+                                                            bool recursive) {
+  if (org_id.empty()) throw std::invalid_argument("org_id is empty");
+  if (src_dirs.empty()) throw std::invalid_argument("src_dirs is empty");
+
+  ensure_dirs(org_root(org_id));
+  ensure_dirs(org_index_base(org_id));
+  ensure_dirs(org_index_base(org_id) / "l5");
+
+  Storage st(org_sqlite(org_id).string());
+  st.init();
+
+  const fs::path out_root = org_l5_shard_root(org_id, shard);
+  ensure_dirs(out_root);
+
+  l5::BuildOptions opt;
+  opt.segment_name = segment_name.empty() ? make_unique_segment_name() : segment_name;
+  opt.max_threads = std::min<unsigned>(std::max(1u, std::thread::hardware_concurrency()),
+                                       env_u32("PLAGIO_BUILD_THREADS", BUILD_THREADS_DEFAULT));
+  opt.ram_limit_bytes = env_u64("PLAGIO_SORT_RAM_BYTES", SORT_RAM_BYTES_DEFAULT);
+
+  // idempotency: if segment dir already exists -> skip
+  {
+    std::error_code ec;
+    if (fs::exists(out_root / opt.segment_name, ec) && !ec) {
+      L5FsIngestResult rr;
+      rr.shard = shard;
+      rr.skipped_existing = true;
+      rr.build.segment_name = opt.segment_name;
+      rr.build.seg_dir = out_root / opt.segment_name;
+      rr.build.built_at_utc = l5::utc_now_compact();
+      return rr;
+    }
+  }
+
+  const fs::path tmp = fs::path(mk_tmp_dir("l5_fs"));
+  const fs::path corpus = tmp / "corpus.jsonl";
+
+  const fs::path ds_root = dataset_root.empty() ? fs::path() : fs::path(dataset_root);
+  const std::string org_j = json(org_id).dump();
+  const std::string prefix = dataset_prefix.empty() ? std::string("fs") : dataset_prefix;
+
+  const char* text_is_normalized_flag = normalize ? "false" : "true"; // normalize=true => core will normalize
+  const size_t cap = (size_t)opt.max_text_bytes_per_doc;
+
+  // 1) collect files
+  std::vector<fs::path> files;
+  files.reserve(10000);
+  for (const auto& d : src_dirs) {
+    fs::path root = fs::path(d);
+    std::error_code ec;
+    if (!fs::exists(root, ec) || ec) continue;
+    if (recursive) {
+      fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+      for (; it != end; it.increment(ec)) {
+        if (ec) { ec.clear(); continue; }
+        if (!it->is_regular_file(ec) || ec) { ec.clear(); continue; }
+        if (lower_ext(it->path()) != ".txt") continue;
+        files.push_back(it->path());
+      }
+    } else {
+      fs::directory_iterator it(root, ec), end;
+      for (; it != end; it.increment(ec)) {
+        if (ec) { ec.clear(); continue; }
+        if (!it->is_regular_file(ec) || ec) { ec.clear(); continue; }
+        if (lower_ext(it->path()) != ".txt") continue;
+        files.push_back(it->path());
+      }
+    }
+  }
+  std::sort(files.begin(), files.end());
+  files.erase(std::unique(files.begin(), files.end()), files.end());
+
+  L5FsIngestResult rr;
+  rr.shard = shard;
+  rr.files_seen = (uint64_t)files.size();
+  if (files.empty()) throw std::runtime_error("no .txt files found in src_dirs");
+
+  // 2) bulk upsert docs (assign internal ids)
+  std::vector<DocRow> rows;
+  rows.reserve(files.size());
+
+  const std::string now = utc_now_iso_utc();
+
+  for (const auto& p : files) {
+    std::string rel;
+    if (!dataset_root.empty()) {
+      std::error_code ec;
+      rel = fs::relative(p, ds_root, ec).generic_string();
+      if (ec || rel.empty() || rel == ".") { ec.clear(); rel = p.filename().generic_string(); }
+    } else {
+      rel = p.filename().generic_string();
+    }
+
+    DocRow r;
+    r.org_id = org_id;
+    r.source_id = prefix + "::" + rel; // unique across dataset
+    r.file_name = basename_of(p);
+    r.title = "";
+    r.author = "";
+    r.created_at = "";
+    r.stored_at_utc = now;
+    r.deleted = 0;
+    r.deleted_at_utc = "";
+    r.last_segment = "";
+    rows.push_back(std::move(r));
+  }
+
+  auto ids = st.upsert_docs_get_ids_bulk(rows);
+  if (ids.size() != rows.size()) throw std::runtime_error("bulk upsert mismatch");
+
+  // 3) write corpus.jsonl
+  std::ofstream out(corpus, std::ios::binary);
+  if (!out) throw std::runtime_error("cannot write corpus.jsonl");
+
+  std::vector<int64_t> indexed_ids;
+  indexed_ids.reserve(rows.size());
+
+  for (size_t i = 0; i < files.size(); ++i) {
+    const auto& p = files[i];
+    auto& row = rows[i];
+
+    std::string rel;
+    if (!dataset_root.empty()) {
+      std::error_code ec;
+      rel = fs::relative(p, ds_root, ec).generic_string();
+      if (ec || rel.empty() || rel == ".") { ec.clear(); rel = p.filename().generic_string(); }
+    } else {
+      rel = p.filename().generic_string();
+    }
+
+    std::string text = read_text_utf8_best_effort(p, cap);
+    if (text.empty()) { rr.files_skipped++; continue; }
+
+    out
+      << "{\"doc_id\":" << json(std::to_string(row.id)).dump()
+      << ",\"organization_id\":" << org_j
+      << ",\"external_id\":" << json(row.source_id).dump()
+      << ",\"source_path\":" << json(rel).dump()
+      << ",\"source_name\":" << json(rel).dump()
+      << ",\"text\":" << json(text).dump()
+      << ",\"text_is_normalized\":" << text_is_normalized_flag
+      << "}\n";
+
+    indexed_ids.push_back(row.id);
+  }
+  out.flush();
+  if (!out) throw std::runtime_error("write failed corpus.jsonl");
+
+  rr.docs_indexed = (uint64_t)indexed_ids.size();
+  if (rr.docs_indexed == 0) throw std::runtime_error("no documents extracted for indexing (all skipped)");
+
+  // 4) build segment (serialize per org)
+  {
+    std::lock_guard<std::mutex> lk(build_mu_for(org_id));
+    rr.build = l5::build_segment_jsonl(corpus, out_root, opt);
+  }
+
+  // 5) update last_segment for indexed docs
+  const std::string last_segment_rel = "l5/" + shard_dir_name(shard) + "/" + rr.build.segment_name;
+  st.update_last_segment_by_ids(org_id, indexed_ids, last_segment_rel);
+
+  // cleanup tmp
+  {
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+  }
+  return rr;
+}

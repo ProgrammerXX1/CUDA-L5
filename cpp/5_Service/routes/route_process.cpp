@@ -206,11 +206,11 @@ void register_route_process(httplib::Server& app, ServiceRouteContext& ctx) {
 
       l5::SearchOptions opt;
       opt.topk = 20;
-      opt.candidates_topn = 2000;
+      opt.candidates_topn = 800;
       opt.min_hits = 1;
       opt.span_min_len = 1;
       opt.span_gap = 5;
-      opt.max_postings_per_hash = 2000000;
+      opt.max_postings_per_hash = 300000;
       opt.alpha = 0.60;
 
       auto r_small = ctx.svc->search_levels(org_id, text, /*query_is_normalized=*/false,

@@ -38,6 +38,15 @@ struct L5ZipIngestResult {
   unsigned shard{0};
 };
 
+struct L5FsIngestResult {
+  l5::BuildStats build;
+  uint64_t files_seen{0};
+  uint64_t files_skipped{0};
+  uint64_t docs_indexed{0};
+  unsigned shard{0};
+  bool skipped_existing{false};
+};
+
 class L5Service {
 public:
   explicit L5Service(std::filesystem::path data_root);
@@ -49,6 +58,15 @@ public:
                                                 std::optional<unsigned> l5_shard_opt,
                                                 const std::string& segment_name_opt,bool normalize);
 
+  // L5: ingest from local filesystem dirs (.txt) into ONE segment (10k docs per job recommended)
+  L5FsIngestResult ingest_l5_fs_dirs_build_segment(const std::string& org_id,
+                                                   const std::string& dataset_root,
+                                                   const std::string& dataset_prefix,
+                                                   const std::vector<std::string>& src_dirs,
+                                                   unsigned shard,
+                                                   const std::string& segment_name,
+                                                   bool normalize,
+                                                   bool recursive);
   // Index one document provided as TEXT (backend-normalized; no core normalization)
   IndexTextResult index_text_document(const std::string& org_id,
                                       const std::string& source_id,

@@ -10,6 +10,9 @@
 #include <cstdlib>
 #include <unordered_map>
 
+#include "segobj_cache.h"
+
+
 namespace l5 {
 
 namespace {
@@ -48,24 +51,31 @@ SearchResult search_out_root(const std::filesystem::path& out_root,
     std::unordered_map<std::string, Hit> best;
     best.reserve(1024);
 
-    for (const auto& seg : manifest.segments) {
-        const auto seg_dir = out_root / seg.segment_name;
+    for (const auto& se : manifest.segments) {
+       const auto seg_dir = out_root / se.segment_name;
 
-        SegmentData segdata;
         std::string err;
-        if (!load_segment_bin(seg_dir, segdata, &err)) {
-            if (search_trace_enabled()) {
-                std::fprintf(stderr, "[L5_SEARCH] load_segment_bin FAIL seg=%s err=%s\n",
-                             seg.segment_name.c_str(), err.c_str());
+        auto segp = segobj_cache().get_or_load(
+          seg_dir,
+          [&](std::string* e) -> std::shared_ptr<SegmentData> {
+            auto sp = std::make_shared<SegmentData>();
+            std::string ee;
+            if (!load_segment_bin(seg_dir, *sp, &ee)) {
+              if (e) *e = ee;
+              return {};
             }
-            continue;
-        }
+            return sp;
+          },
+          &err
+        );
+        if (!segp) continue;
+        const SegmentData& segdata = *segp;
 
         std::vector<DocInfo> docinfo;
         if (!load_docids_json(seg_dir, docinfo, &err)) {
             if (search_trace_enabled()) {
                 std::fprintf(stderr, "[L5_SEARCH] load_docids_json FAIL seg=%s err=%s\n",
-                             seg.segment_name.c_str(), err.c_str());
+                             se.segment_name.c_str(), err.c_str());
             }
             continue;
         }
@@ -75,7 +85,7 @@ SearchResult search_out_root(const std::filesystem::path& out_root,
         auto hits = search_in_segment(segdata, docinfo, q, opt);
         if (search_trace_enabled()) {
             std::fprintf(stderr, "[L5_SEARCH] seg=%s hits=%zu\n",
-                         seg.segment_name.c_str(), hits.size());
+                         se.segment_name.c_str(), hits.size());
         }
         for (auto& h : hits) {
             auto it = best.find(h.doc_id);
