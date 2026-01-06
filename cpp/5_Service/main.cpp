@@ -170,7 +170,6 @@ static jjson manifest_to_json_local(const l5::Manifest& m) {
 }
 
 static std::vector<std::string> worker_types_for_kind(const std::string& kind) {
-  if (kind == "ingest") return {"INGEST_L5_ZIP", "INDEX_TEXT", "INGEST_L5_FS"};
   if (kind == "compact") return {"COMPACT_SMALL", "COMPACT_L5", "REBUILD_ONE"};
   if (kind == "admin") return {"WIPE_ALL"};
   return {}; // empty => all
@@ -227,46 +226,6 @@ static int run_job(const fs::path& data_root, int64_t job_id) {
         {"post9", r.build.post9},
         {"built_at_utc", r.build.built_at_utc}
       };
-
-      q.mark_done(job_id, out.dump());
-      return 0;
-    }
-
-    if (job->type == "INGEST_L5_FS") {
-      const std::string dataset_root  = payload.value("dataset_root", "");
-      const std::string dataset_prefix= payload.value("dataset_prefix", "cc100_ru");
-      const bool normalize = payload.value("normalize", 1) != 0;
-      const bool recursive = payload.value("recursive", 0) != 0;
-      const std::string segment_name = payload.value("segment_name", "");
-
-      unsigned shard = (unsigned)payload.value("l5_shard", 0u);
-      std::vector<std::string> src_dirs;
-      if (payload.contains("src_dirs") && payload["src_dirs"].is_array()) {
-        for (const auto& v : payload["src_dirs"]) {
-          if (v.is_string()) src_dirs.push_back(v.get<std::string>());
-        }
-      }
-      if (src_dirs.empty()) throw std::runtime_error("src_dirs is empty");
-
-      auto r = svc.ingest_l5_fs_dirs_build_segment(org_id, dataset_root, dataset_prefix, src_dirs,
-                                                   shard, segment_name, normalize, recursive);
-
-      jjson out = jjson::object();
-      out["ok"] = true;
-      out["type"] = "INGEST_L5_FS";
-      out["org_id"] = org_id;
-      out["dataset_root"] = dataset_root;
-      out["dataset_prefix"] = dataset_prefix;
-      out["segment_name"] = r.build.segment_name;
-      out["seg_dir"] = r.build.seg_dir.string();
-      out["shard"] = r.shard;
-      out["normalize"] = normalize ? 1 : 0;
-      out["recursive"] = recursive ? 1 : 0;
-      out["files_seen"] = r.files_seen;
-      out["files_skipped"] = r.files_skipped;
-      out["docs_indexed"] = r.docs_indexed;
-      out["skipped_existing"] = r.skipped_existing ? 1 : 0;
-      out["built_at_utc"] = r.build.built_at_utc;
 
       q.mark_done(job_id, out.dump());
       return 0;
@@ -541,7 +500,11 @@ static int run_api(const fs::path& data_root) {
   constexpr size_t MAX_JSON_BODY_BYTES   = 4ull * 1024 * 1024;
   constexpr size_t MAX_TEXT_BYTES        = 2ull * 1024 * 1024;
   constexpr size_t MAX_QUERY_BYTES       = 2ull * 1024 * 1024;
-  constexpr size_t MAX_ZIP_UPLOAD_BYTES  = 512ull * 1024 * 1024; // httplib keeps multipart in RAM
+  constexpr size_t MAX_ZIP_UPLOAD_BYTES  = 10ull * 1024 * 1024 * 1024; // httplib keeps multipart in RAM
+
+  app.set_read_timeout(3600, 0);
+  app.set_write_timeout(3600, 0);
+  app.set_payload_max_length(MAX_ZIP_UPLOAD_BYTES + 256ull * 1024 * 1024); // +multipart overhead
 
   ServiceRouteContext ctx;
   ctx.data_root = data_root;
